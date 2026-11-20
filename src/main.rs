@@ -118,6 +118,21 @@ mod term {
             }
             return app.quit;
         }
+        if app.domains_open() {
+            match code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    app.quit = true;
+                    return true;
+                }
+                KeyCode::Esc | KeyCode::Char('d') => app.close_domains(),
+                KeyCode::Down | KeyCode::Char('j') => app.domains_move(1),
+                KeyCode::Up | KeyCode::Char('k') => app.domains_move(-1),
+                KeyCode::Enter | KeyCode::Char(' ') => app.domain_toggle(),
+                KeyCode::Char('s') => app.show_settings(),
+                _ => {}
+            }
+            return app.quit;
+        }
         if app.abuse_open() {
             match code {
                 KeyCode::Char('q') | KeyCode::Char('Q') => {
@@ -149,6 +164,10 @@ mod term {
                     app.close_detail();
                     app.show_abuse();
                 }
+                KeyCode::Char('d') => {
+                    app.close_detail();
+                    app.show_domains();
+                }
                 KeyCode::Char('s') => app.show_settings(),
                 KeyCode::Char(' ') => app.toggle_pause(),
                 _ => {}
@@ -165,6 +184,7 @@ mod term {
             KeyCode::Char('r') => app.poll_once("manual"),
             KeyCode::Char('s') => app.show_settings(),
             KeyCode::Char('a') => app.show_abuse(),
+            KeyCode::Char('d') => app.show_domains(),
             KeyCode::Char('t') => app.cycle_flow_win(),
             KeyCode::Tab => app.cycle_panel(),
             KeyCode::Char('1') => app.select_panel(0),

@@ -17,6 +17,10 @@ pub struct Settings {
     pub time_format: String,
     /// How long a resolved (or failed) hostname is trusted, in hours.
     pub dns_cache_hours: u64,
+    /// Hosted domains selected in the domain filter (`d`). Empty list =
+    /// no restriction (all domains).
+    #[serde(default)]
+    pub domains: Vec<String>,
 }
 
 impl Default for Settings {
@@ -26,6 +30,7 @@ impl Default for Settings {
             hide_noise: true,
             time_format: Settings::TIME_FORMATS[0].to_string(),
             dns_cache_hours: 24,
+            domains: Vec::new(),
         }
     }
 }
@@ -103,6 +108,7 @@ mod tests {
             hide_noise: false,
             time_format: "%H:%M:%S".into(),
             dns_cache_hours: 6,
+            domains: vec!["example.com".into()],
         };
         s.save(&path).unwrap();
         let loaded = Settings::load(&path).unwrap();

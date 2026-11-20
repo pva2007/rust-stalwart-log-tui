@@ -75,6 +75,21 @@ Under the hood each entity keeps its own per-minute flow history (coalesced)
 plus peer counters, so drill-downs reflect the whole loaded history and stay
 live as new events arrive.
 
+## Mail in/out and the domain filter
+
+The **Event categories** panel is followed by a **Mail in/out (sender →
+recipient)** table: the top mail flows with their direction relative to the
+domains hosted on the server — `in` (delivery to a hosted mailbox), `out`
+(sent from a hosted domain to the outside), `local` (hosted → hosted).
+Pairs are aggregated from Queued/Delivered events.
+
+Hosted domains are detected from the logs themselves: every message stored
+into a local mailbox (`message-ingest.*` events) contributes its recipient
+domain. Press `d` to open the hosted-domain filter — tick one or many
+domains (or leave everything unticked for all), and the mail in/out table
+restricts itself to flows touching the selection. The filter persists in
+`stalwart-log.toml` as `domains = [...]` (empty list = all).
+
 ## Settings
 
 Press `s` to open the settings overlay. Navigate with `j`/`k` (or arrow keys),
@@ -96,6 +111,7 @@ show_hostnames = false
 hide_noise = false
 time_format = "%H:%M:%S"
 dns_cache_hours = 24
+domains = []
 ```
 
 ## Sample data

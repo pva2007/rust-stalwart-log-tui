@@ -96,7 +96,8 @@ pub fn draw(f: &mut Frame, app: &App) {
             Constraint::Length(6), // throughput sparkline
             Constraint::Length(8), // mail flow (in/out/err)
             Constraint::Length(6), // level gauges
-            Constraint::Min(0),    // categories
+            Constraint::Length(7), // event categories (3 columns, 5 rows)
+            Constraint::Min(0),    // mail in/out (sender -> recipient)
         ])
         .split(body[0]);
 
@@ -113,6 +114,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_mail_flow(f, app, left[1]);
     draw_levels(f, app, left[2]);
     draw_categories(f, app, left[3]);
+    draw_mail_pairs(f, app, left[4]);
     let interactive = !app.settings_open();
     draw_top_ips(f, app, right[0], interactive);
     draw_top_addresses(f, app, right[1], interactive);
@@ -122,6 +124,61 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.settings_open() {
         draw_settings(f, app, f.area());
     }
+    if app.domains_open() {
+        draw_domains(f, app, f.area());
+    }
+}
+
+fn draw_domains(f: &mut Frame, app: &App, area: Rect) {
+    let rows = app.domain_rows();
+    let width = 50u16.min(area.width.saturating_sub(4)).max(20);
+    let height = (rows.len() as u16 + 4).min(area.height);
+    let popup = centered_rect(area, width, height);
+
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (name, count))| {
+            let selected = i == app.domain_row;
+            let active = if i == 0 {
+                app.settings.domains.is_empty()
+            } else {
+                app.settings.domains.contains(name)
+            };
+            let style = if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {}  ", if selected { ">" } else { " " }), style),
+                Span::styled(format!("[{}] ", if active { "x" } else { " " }), style),
+                Span::styled(format!("{:<26}", truncate(name, 26)), style),
+                Span::styled(format!("{:>7} msgs ", human_count(*count)), style),
+            ]))
+        })
+        .collect();
+
+    let help = Line::from(Span::styled(
+        " up/down select, enter/space toggle, empty selection = all, d/Esc close  ",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Hosted domain filter ")
+        .style(Style::default().bg(Color::Black));
+    let list = List::new(items).block(block);
+    f.render_widget(ratatui::widgets::Clear, popup);
+    f.render_widget(list, popup);
+
+    let help_area = Rect {
+        x: popup.x,
+        y: popup.y + popup.height - 1,
+        width: popup.width,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(help), help_area);
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect, now: DateTime<Utc>) {
@@ -282,41 +339,102 @@ fn draw_categories(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or(1)
         .max(1);
 
-    // compact: two columns so the panel stays small even on narrow screens
+    // compact: three columns of five rows so the panel stays slim
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Ratio(1, 3); 3])
         .split(area);
 
-    let make_items = |cats: &[Category]| -> Vec<ListItem<'static>> {
+    let make_items = |cats: &[Category], width: u16| -> Vec<ListItem<'static>> {
+        let name_w = width.saturating_sub(7).clamp(8, 20) as usize;
         cats.iter()
             .map(|c| {
                 let count = app.stats.category_count(*c);
-                let bar_len = ((count as f64 / max as f64) * 8.0) as usize;
-                let bar = "█".repeat(bar_len.max(if count > 0 { 1 } else { 0 }));
+                let mark = if count as f64 / max as f64 > 0.66 {
+                    "██"
+                } else if count > 0 {
+                    "█ "
+                } else {
+                    "  "
+                };
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        format!("{:<22}", truncate(c.as_str(), 22)),
+                        format!("{:<nw$}", truncate(c.as_str(), name_w), nw = name_w),
                         Style::default().fg(Color::Gray),
                     ),
-                    Span::styled(format!("{bar:<8}"), Style::default().fg(c.color())),
-                    Span::styled(format!("{:>7}", human_count(count)), Style::default().fg(Color::White)),
+                    Span::styled(mark, Style::default().fg(c.color())),
+                    Span::styled(format!("{:>5}", human_count(count)), Style::default().fg(Color::White)),
                 ]))
             })
             .collect()
     };
-    let (a, b) = Category::ALL.split_at(Category::ALL.len().div_ceil(2));
-    let left: Vec<ListItem> = make_items(a);
-    let right: Vec<ListItem> = make_items(b);
+    let cats = Category::ALL;
+    let parts = |col: usize| -> Vec<ListItem> {
+        let start = col * cats.len().div_ceil(3);
+        let end = ((col + 1) * cats.len().div_ceil(3)).min(cats.len());
+        make_items(&cats[start..end], cols[col].width.saturating_sub(2))
+    };
 
     f.render_widget(
-        List::new(left).block(Block::default().borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM).title(" Event categories ")),
+        List::new(parts(0)).block(Block::default().borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM).title(" Event categories ")),
         cols[0],
     );
     f.render_widget(
-        List::new(right).block(Block::default().borders(Borders::RIGHT | Borders::TOP | Borders::BOTTOM)),
+        List::new(parts(1)).block(Block::default().borders(Borders::TOP | Borders::BOTTOM)),
         cols[1],
     );
+    f.render_widget(
+        List::new(parts(2)).block(Block::default().borders(Borders::RIGHT | Borders::TOP | Borders::BOTTOM)),
+        cols[2],
+    );
+}
+
+/// Table of mail flows sender -> recipient (from Queued/Delivered events),
+/// optionally restricted by the domain filter (key `d`).
+fn draw_mail_pairs(f: &mut Frame, app: &App, area: Rect) {
+    let rows = app.mail_pairs(200);
+    let inner_w = area.width.saturating_sub(6).max(20) as usize;
+    let addr_w = (inner_w.saturating_sub(14) / 2).clamp(16, 44);
+
+    let mut items: Vec<ListItem> = Vec::new();
+    if rows.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  no mail flow events (Queued/Delivered) match the filter",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    } else {
+        let max = rows.first().map(|p| p.count).unwrap_or(1).max(1);
+        let bar_max = inner_w.saturating_sub(addr_w * 2 + 18).clamp(0, 20);
+        for p in &rows {
+            let bar_len = ((p.count as f64 / max as f64) * bar_max as f64) as usize;
+            let bar = if bar_max > 0 { "█".repeat(bar_len.max(1)) } else { String::new() };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(format!(" {:<6}", p.dir.as_str()), Style::default().fg(p.dir.color())),
+                Span::styled(format!("{:<aw$}", truncate(&p.from, addr_w), aw = addr_w), Style::default().fg(Color::Gray)),
+                Span::styled("→ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:<aw$}", truncate(&p.to, addr_w), aw = addr_w), Style::default().fg(Color::Gray)),
+                Span::styled(format!("{:>6} ", human_count(p.count)), Style::default().fg(Color::White)),
+                Span::styled(bar, Style::default().fg(p.dir.color())),
+            ])));
+        }
+    }
+
+    let filter = if app.domain_filter_active() {
+        let doms = &app.settings.domains;
+        format!(" [filter: {}{}]", doms[0], if doms.len() > 1 { format!(" +{}", doms.len() - 1) } else { String::new() })
+    } else {
+        " [all domains]".to_string()
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(" Mail in/out (sender → recipient) ", Style::default().fg(Color::Gray)))
+            .title(Span::styled(
+                format!("{:>width$}", filter, width = (area.width as usize).saturating_sub(38)),
+                Style::default().fg(Color::DarkGray),
+            )),
+    );
+    f.render_widget(list, area);
 }
 
 fn draw_top_ips(f: &mut Frame, app: &App, area: Rect, interactive: bool) {
@@ -834,6 +952,8 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         Span::raw(" settings   "),
         Span::styled(" a ", chip),
         Span::raw(" abuse   "),
+        Span::styled(" d ", chip),
+        Span::raw(" domains   "),
     ];
     (!app.abuse_open() && app.detail.is_none())
         .then(|| {

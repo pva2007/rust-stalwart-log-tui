@@ -21,6 +21,9 @@ pub const NEW_WINDOW_MIN: i64 = 24 * 60;
 /// Bounds so hostile logs cannot balloon memory.
 pub const MAX_TRACKED_USERS: usize = 100_000;
 pub const MAX_REASONS_PER_IP: usize = 50;
+/// Upper bound on distinct (sender, recipient) pairs kept for the mail
+/// in/out table.
+pub const MAX_MAIL_PAIRS: usize = 20_000;
 
 /// Per-client-IP authentication bookkeeping for the abuse view.
 #[derive(Debug, Default)]
@@ -289,6 +292,54 @@ pub struct AbuseReport {
     pub accounts: Vec<AttackedAccount>,
 }
 
+/// Direction of a mail flow relative to the hosted domains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailDir {
+    In,
+    Out,
+    Local,
+    Transit,
+}
+
+impl MailDir {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MailDir::In => "in",
+            MailDir::Out => "out",
+            MailDir::Local => "local",
+            MailDir::Transit => "relay",
+        }
+    }
+
+    pub fn color(&self) -> ratatui::style::Color {
+        use ratatui::style::Color;
+        match self {
+            MailDir::In => Color::Cyan,
+            MailDir::Out => Color::Green,
+            MailDir::Local => Color::Magenta,
+            MailDir::Transit => Color::DarkGray,
+        }
+    }
+}
+
+/// One aggregated mail flow: sender -> recipient with its direction and
+/// message count.
+#[derive(Debug, Clone)]
+pub struct MailPair {
+    pub from: String,
+    pub to: String,
+    pub dir: MailDir,
+    pub count: u64,
+}
+
+/// Domain part of an email address (lowercased by `emails_in`); for input
+/// without an `@` the input itself is returned.
+pub fn domain_of(addr: &str) -> String {
+    addr.rsplit_once('@')
+        .map(|(_, d)| d.to_string())
+        .unwrap_or_else(|| addr.to_string())
+}
+
 #[derive(Debug, Default)]
 pub struct Stats {
     pub total: u64,
@@ -306,6 +357,13 @@ pub struct Stats {
     pub top_ips: HashMap<String, u64>,
     pub top_senders: HashMap<String, u64>,
     pub top_recipients: HashMap<String, u64>,
+
+    /// Aggregated mail flow per (sender, recipient) pair, from Queued and
+    /// Delivered events.
+    pub mail_pairs: HashMap<(String, String), u64>,
+    /// Domains of mail stored into local mailboxes (message-ingest events):
+    /// domain -> stored-message count. The "hosted" domains of this server.
+    pub hosted_mailboxes: HashMap<String, u64>,
 
     /// Per-minute in/out/err/blk flow for ALL events (key `EntityKind`-less).
     pub flow: FlowHist,
@@ -384,6 +442,8 @@ impl Stats {
             }
         }
 
+        self.track_mail(record, sender_key.as_deref(), &recipients);
+
         if matches!(record.category, Category::AuthFail | Category::AuthOk) {
             self.track_auth(record, &ip_keys, minute);
         }
@@ -407,6 +467,87 @@ impl Stats {
         if record.category != Category::Noise {
             self.bucket_count_active += 1;
         }
+    }
+
+    /// Track sender->recipient mail flow (for the mail in/out table) and
+    /// detect the hosted domains (local mailbox ingest events).
+    fn track_mail(&mut self, record: &LogRecord, sender_key: Option<&str>, recipients: &[String]) {
+        if recipients.is_empty() {
+            return;
+        }
+        // message-ingest.* = message stored into a local mailbox, so its
+        // recipient domains are hosted on this server.
+        if record.event.as_deref().is_some_and(|e| e.starts_with("message-ingest")) {
+            for to in recipients {
+                *self.hosted_mailboxes.entry(domain_of(to)).or_default() += 1;
+            }
+        }
+        let Some(from) = sender_key else { return };
+        // Queued = acceptance of a message (in to local, out via submission),
+        // Delivered = remote delivery of a local message (out).
+        if !matches!(record.category, Category::Queued | Category::Delivered) {
+            return;
+        }
+        for to in recipients {
+            let pair = (from.to_string(), to.clone());
+            if self.mail_pairs.len() < MAX_MAIL_PAIRS {
+                *self.mail_pairs.entry(pair).or_default() += 1;
+            } else if let Some(c) = self.mail_pairs.get_mut(&pair) {
+                *c += 1;
+            }
+        }
+    }
+
+    /// Hosted domains with their stored-mail counts, most active first.
+    pub fn hosted_domains(&self) -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = self
+            .hosted_mailboxes
+            .iter()
+            .map(|(d, c)| (d.clone(), *c))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
+    /// Top sender->recipient pairs, optionally restricted to mail touching
+    /// one of the given hosted domains (`domains` empty selects everything,
+    /// like `None`). Direction is derived from the hosted-domain set:
+    /// recipient hosted = in, sender hosted = out, both = local.
+    pub fn top_mail_pairs(&self, n: usize, domains: Option<&[String]>) -> Vec<MailPair> {
+        let sel: Option<HashSet<&str>> = domains.map(|ds| ds.iter().map(|s| s.as_str()).collect());
+        let mut rows: Vec<MailPair> = self
+            .mail_pairs
+            .iter()
+            .filter(|((f, t), _)| {
+                let fd = domain_of(f);
+                let td = domain_of(t);
+                self.hosted_mailboxes.contains_key(&fd) || self.hosted_mailboxes.contains_key(&td)
+            })
+            .filter(|((f, t), _)| {
+                sel.as_ref().is_none_or(|s| {
+                    s.contains(domain_of(f).as_str()) || s.contains(domain_of(t).as_str())
+                })
+            })
+            .map(|((f, t), c)| {
+                let fd = self.hosted_mailboxes.contains_key(&domain_of(f));
+                let td = self.hosted_mailboxes.contains_key(&domain_of(t));
+                let dir = match (fd, td) {
+                    (false, true) => MailDir::In,
+                    (true, false) => MailDir::Out,
+                    (true, true) => MailDir::Local,
+                    (false, false) => MailDir::Transit,
+                };
+                MailPair {
+                    from: f.clone(),
+                    to: t.clone(),
+                    dir,
+                    count: *c,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.from.cmp(&b.from)));
+        rows.truncate(n);
+        rows
     }
 
     /// Update the per-entity drill-down stats: per-entity counters and flow
@@ -988,6 +1129,83 @@ mod tests {
         assert_eq!(r.records.len(), 0);
         assert!(!fs::read(&bz2).unwrap().is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn hosted_domains_and_mail_pairs() {
+        let mut s = Stats::new();
+        // inbound spam queued for a local mailbox (-> hosted detection below)
+        s.ingest(
+            &parse_line(
+                "2026-11-19T00:01:52Z INFO Queued message for delivery (queue.message-queued) remoteIp = 167.89.48.242, from = \"bounces+x@em7433.profi-pozicka.sk\", to = [\"hotel@mager.sk\"]",
+            ),
+            dt(1_800_000_000),
+        );
+        // local mailbox ingest identifies the hosted domain
+        s.ingest(
+            &parse_line(
+                "2026-11-19T00:01:53Z INFO Message stored (message-ingest.message-stored) queueName = \"local\", from = \"b+x@em7433.profi-pozicka.sk\", to = [\"hotel@mager.sk\"]",
+            ),
+            dt(1_800_000_000),
+        );
+        // outbound delivery from a hosted domain
+        s.ingest(
+            &parse_line(
+                "2026-11-19T00:37:28Z INFO Message delivered (delivery.delivered) remoteIp = 1.2.3.4, from = \"info@mager.sk\", to = [\"zakaznik@terasport.cz\"]",
+            ),
+            dt(1_800_000_000),
+        );
+
+        assert_eq!(s.hosted_domains(), vec![("mager.sk".to_string(), 1)]);
+        let pairs = s.top_mail_pairs(10, None);
+        assert_eq!(pairs.len(), 2);
+        let in_pair = pairs.iter().find(|p| p.to.ends_with("@mager.sk")).unwrap();
+        assert_eq!(in_pair.dir, MailDir::In);
+        let out_pair = pairs.iter().find(|p| p.from.ends_with("@mager.sk")).unwrap();
+        assert_eq!(out_pair.dir, MailDir::Out);
+        // filter: only pairs touching the selected domain
+        let filtered = s.top_mail_pairs(10, Some(&["mager.sk".to_string()]));
+        assert_eq!(filtered.len(), 2);
+        let filtered = s.top_mail_pairs(10, Some(&["other.example".to_string()]));
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn mail_pairs_local_and_respect_hosted_only() {
+        let mut s = Stats::new();
+        s.ingest(
+            &parse_line(
+                "2026-11-19T10:00:00Z INFO Message stored (message-ingest.message-stored) queueName = \"local\", from = \"x@cdn21.de\", to = [\"postmaster@cdn21.de\"]",
+            ),
+            dt(1_800_000_000),
+        );
+        // relay attempt external -> external: pair must not appear
+        s.ingest(
+            &parse_line(
+                "2026-11-19T10:01:00Z INFO Queued message for delivery (queue.message-queued) remoteIp = 5.6.7.8, from = \"a@spam.example\", to = [\"b@elsewhere.example\"]",
+            ),
+            dt(1_800_000_000),
+        );
+        // local: hosted -> hosted
+        s.ingest(
+            &parse_line(
+                "2026-11-19T10:02:00Z INFO Queued message for delivery (queue.message-queued) remoteIp = 172.19.0.6, from = \"x@cdn21.de\", to = [\"hotel@mager.sk\"]",
+            ),
+            dt(1_800_000_000),
+        );
+        s.ingest(
+            &parse_line(
+                "2026-11-19T10:02:10Z INFO Message stored (message-ingest.message-stored) queueName = \"local\", from = \"x@cdn21.de\", to = [\"hotel@mager.sk\"]",
+            ),
+            dt(1_800_000_000),
+        );
+        let hosted: std::collections::HashSet<String> =
+            s.hosted_domains().into_iter().map(|(d, _)| d).collect();
+        assert!(hosted.contains("cdn21.de") && hosted.contains("mager.sk"));
+        let pairs = s.top_mail_pairs(10, None);
+        assert!(pairs.iter().all(|p| p.dir != MailDir::Transit));
+        // hosted -> hosted queued mail is "local"
+        assert_eq!(pairs.iter().find(|p| p.from == "x@cdn21.de").unwrap().dir, MailDir::Local);
     }
 
     /// Integration check against the real log files shipped in `sample/`.

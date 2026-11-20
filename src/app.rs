@@ -1,7 +1,7 @@
 use crate::dns::DnsCache;
 use crate::parser::LogRecord;
 use crate::settings::Settings;
-use crate::stats::{EntityKind, FlowHist, MinutePoint, Stats};
+use crate::stats::{EntityKind, FlowHist, MailPair, MinutePoint, Stats};
 use crate::watcher::FolderWatcher;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -20,6 +20,7 @@ enum Overlay {
     None,
     Settings,
     Abuse,
+    Domains,
 }
 
 pub struct App {
@@ -44,6 +45,8 @@ pub struct App {
 
     /// Abuse/signals view: which suspect row is selected.
     pub abuse_row: usize,
+    /// Domain filter picker: which row is selected (0 = "all").
+    pub domain_row: usize,
 
     /// Top-list selection: 0 = client IPs, 1 = senders, 2 = recipients.
     pub sel_panel: usize,
@@ -84,6 +87,7 @@ impl App {
             overlay: Overlay::None,
             dns_requested: HashSet::new(),
             abuse_row: 0,
+            domain_row: 0,
             sel_panel: 0,
             sel_row: 0,
             detail: None,
@@ -216,6 +220,68 @@ impl App {
         if let Err(e) = self.settings.save(&self.settings_path) {
             self.status = format!("settings save failed: {e}");
         }
+    }
+
+    // --- domain filter picker ---
+
+    pub fn show_domains(&mut self) {
+        self.overlay = Overlay::Domains;
+        self.domain_row = 0;
+    }
+
+    pub fn close_domains(&mut self) {
+        self.overlay = Overlay::None;
+    }
+
+    pub fn domains_open(&self) -> bool {
+        matches!(self.overlay, Overlay::Domains)
+    }
+
+    /// Picker rows: first row is "all domains" (empty selection).
+    pub fn domain_rows(&self) -> Vec<(String, u64)> {
+        vec![("(all domains)".to_string(), self.stats.mail_pairs.len() as u64)]
+            .into_iter()
+            .chain(self.stats.hosted_domains())
+            .collect()
+    }
+
+    pub fn domains_move(&mut self, delta: i8) {
+        let len = self.domain_rows().len();
+        if len == 0 {
+            return;
+        }
+        let row = self.domain_row as i64 + delta as i64;
+        self.domain_row = row.rem_euclid(len as i64) as usize;
+    }
+
+    /// Toggle the selected domain in the filter; the "all" row clears it.
+    /// Persists the settings.
+    pub fn domain_toggle(&mut self) {
+        if self.domain_row == 0 {
+            self.settings.domains.clear();
+        } else {
+            let rows = self.domain_rows();
+            if let Some((name, _)) = rows.get(self.domain_row) {
+                let name = name.clone();
+                if let Some(pos) = self.settings.domains.iter().position(|d| *d == name) {
+                    self.settings.domains.swap_remove(pos);
+                } else {
+                    self.settings.domains.push(name);
+                }
+            }
+        }
+        self.persist_settings();
+    }
+
+    /// Whether the pairs view is restricted to selected domains.
+    pub fn domain_filter_active(&self) -> bool {
+        !self.settings.domains.is_empty()
+    }
+
+    /// Top sender->recipient rows honoring the domain filter (row cap).
+    pub fn mail_pairs(&self, n: usize) -> Vec<MailPair> {
+        let domains = self.domain_filter_active().then(|| self.settings.domains.clone());
+        self.stats.top_mail_pairs(n, domains.as_deref())
     }
 
     // --- abuse / signals view ---
