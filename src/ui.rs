@@ -394,7 +394,7 @@ fn draw_categories(f: &mut Frame, app: &App, area: Rect) {
 fn draw_mail_pairs(f: &mut Frame, app: &App, area: Rect) {
     let rows = app.mail_pairs(200);
     let inner_w = area.width.saturating_sub(6).max(20) as usize;
-    let addr_w = (inner_w.saturating_sub(14) / 2).clamp(16, 44);
+    let addr_w = (inner_w.saturating_sub(34) / 2).clamp(16, 44);
 
     let mut items: Vec<ListItem> = Vec::new();
     if rows.is_empty() {
@@ -404,16 +404,23 @@ fn draw_mail_pairs(f: &mut Frame, app: &App, area: Rect) {
         ))));
     } else {
         let max = rows.first().map(|p| p.count).unwrap_or(1).max(1);
-        let bar_max = inner_w.saturating_sub(addr_w * 2 + 18).clamp(0, 20);
+        let time_w = 16usize;
+        let bar_max = inner_w
+            .saturating_sub(addr_w * 2 + 12 + time_w + 2)
+            .clamp(0, 20);
         for p in &rows {
             let bar_len = ((p.count as f64 / max as f64) * bar_max as f64) as usize;
             let bar = if bar_max > 0 { "█".repeat(bar_len.max(1)) } else { String::new() };
+            let seen = chrono::DateTime::from_timestamp(p.last_seen * 60, 0)
+                .map(|t| format_time(app, t))
+                .unwrap_or_default();
             items.push(ListItem::new(Line::from(vec![
                 Span::styled(format!(" {:<6}", p.dir.as_str()), Style::default().fg(p.dir.color())),
                 Span::styled(format!("{:<aw$}", truncate(&p.from, addr_w), aw = addr_w), Style::default().fg(Color::Gray)),
                 Span::styled("→ ", Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{:<aw$}", truncate(&p.to, addr_w), aw = addr_w), Style::default().fg(Color::Gray)),
-                Span::styled(format!("{:>6} ", human_count(p.count)), Style::default().fg(Color::White)),
+                Span::styled(format!("{:>5} ", human_count(p.count)), Style::default().fg(Color::White)),
+                Span::styled(format!("{:<tw$} ", truncate(&seen, time_w), tw = time_w), Style::default().fg(Color::DarkGray)),
                 Span::styled(bar, Style::default().fg(p.dir.color())),
             ])));
         }
@@ -423,7 +430,7 @@ fn draw_mail_pairs(f: &mut Frame, app: &App, area: Rect) {
         let doms = &app.settings.domains;
         format!(" [filter: {}{}]", doms[0], if doms.len() > 1 { format!(" +{}", doms.len() - 1) } else { String::new() })
     } else {
-        " [all domains]".to_string()
+        " [all domains, newest first]".to_string()
     };
     let list = List::new(items).block(
         Block::default()

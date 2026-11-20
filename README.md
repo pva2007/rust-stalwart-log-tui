@@ -81,7 +81,9 @@ The **Event categories** panel is followed by a **Mail in/out (sender →
 recipient)** table: the top mail flows with their direction relative to the
 domains hosted on the server — `in` (delivery to a hosted mailbox), `out`
 (sent from a hosted domain to the outside), `local` (hosted → hosted).
-Pairs are aggregated from Queued/Delivered events.
+Pairs are aggregated from Queued/Delivered events and ordered by their
+most recent activity, newest first (total volume is shown as a column
+and breaks ties).
 
 Both Top panels and the mail in/out table count **messages, not log lines**:
 one physical mail (identified by its unique `queueId`) passes through TCP →

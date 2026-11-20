@@ -324,14 +324,24 @@ impl MailDir {
     }
 }
 
-/// One aggregated mail flow: sender -> recipient with its direction and
-/// message count.
+/// One aggregated mail flow: sender -> recipient with its direction, message
+/// count and the time of its most recent message.
 #[derive(Debug, Clone)]
 pub struct MailPair {
     pub from: String,
     pub to: String,
     pub dir: MailDir,
     pub count: u64,
+    /// Minute (epoch/60) of the pair's most recent message.
+    pub last_seen: i64,
+}
+
+/// Per-pair counters for the mail in/out table.
+#[derive(Debug, Default, Clone)]
+pub struct PairStat {
+    pub count: u64,
+    /// Minute of the pair's most recent message.
+    pub last_minute: i64,
 }
 
 /// Domain part of an email address (lowercased by `emails_in`); for input
@@ -360,9 +370,9 @@ pub struct Stats {
     pub top_senders: HashMap<String, u64>,
     pub top_recipients: HashMap<String, u64>,
 
-    /// Aggregated mail flow per (sender, recipient) pair, from Queued and
-    /// Delivered events.
-    pub mail_pairs: HashMap<(String, String), u64>,
+    /// Per-pair counters for the mail in/out table; one physical mail per
+    /// message id, `last_minute` from its newest log line.
+    pub mail_pairs: HashMap<(String, String), PairStat>,
     /// Domains of mail stored into local mailboxes (message-ingest events):
     /// domain -> stored-message count. The "hosted" domains of this server.
     pub hosted_mailboxes: HashMap<String, u64>,
@@ -472,7 +482,7 @@ impl Stats {
             *self.top_senders.entry(d.to_string()).or_default() += 1;
         }
 
-        self.track_mail(record, countable, sender_key.as_deref(), &recipients);
+        self.track_mail(record, countable, sender_key.as_deref(), &recipients, minute);
 
         if matches!(record.category, Category::AuthFail | Category::AuthOk) {
             self.track_auth(record, &ip_keys, minute);
@@ -508,6 +518,7 @@ impl Stats {
         fresh: bool,
         sender_key: Option<&str>,
         recipients: &[String],
+        minute: i64,
     ) {
         if recipients.is_empty() {
             return;
@@ -530,10 +541,11 @@ impl Stats {
         }
         for to in recipients {
             let pair = (from.to_string(), to.clone());
-            if self.mail_pairs.len() < MAX_MAIL_PAIRS {
-                *self.mail_pairs.entry(pair).or_default() += 1;
-            } else if let Some(c) = self.mail_pairs.get_mut(&pair) {
-                *c += 1;
+            if let Some(stat) = self.mail_pairs.get_mut(&pair) {
+                stat.count += 1;
+                stat.last_minute = stat.last_minute.max(minute);
+            } else if self.mail_pairs.len() < MAX_MAIL_PAIRS {
+                self.mail_pairs.insert(pair, PairStat { count: 1, last_minute: minute });
             }
         }
     }
@@ -552,7 +564,8 @@ impl Stats {
     /// Top sender->recipient pairs, optionally restricted to mail touching
     /// one of the given hosted domains (`domains` empty selects everything,
     /// like `None`). Direction is derived from the hosted-domain set:
-    /// recipient hosted = in, sender hosted = out, both = local.
+    /// recipient hosted = in, sender hosted = out, both = local. Ordered by
+    /// most recent activity (newest first), volume as tiebreaker.
     pub fn top_mail_pairs(&self, n: usize, domains: Option<&[String]>) -> Vec<MailPair> {
         let sel: Option<HashSet<&str>> = domains.map(|ds| ds.iter().map(|s| s.as_str()).collect());
         let mut rows: Vec<MailPair> = self
@@ -568,7 +581,7 @@ impl Stats {
                     s.contains(domain_of(f).as_str()) || s.contains(domain_of(t).as_str())
                 })
             })
-            .map(|((f, t), c)| {
+            .map(|((f, t), stat)| {
                 let fd = self.hosted_mailboxes.contains_key(&domain_of(f));
                 let td = self.hosted_mailboxes.contains_key(&domain_of(t));
                 let dir = match (fd, td) {
@@ -581,11 +594,18 @@ impl Stats {
                     from: f.clone(),
                     to: t.clone(),
                     dir,
-                    count: *c,
+                    count: stat.count,
+                    last_seen: stat.last_minute,
                 }
             })
             .collect();
-        rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.from.cmp(&b.from)));
+        // most recently active first; total volume breaks ties
+        rows.sort_by(|a, b| {
+            b.last_seen
+                .cmp(&a.last_seen)
+                .then_with(|| b.count.cmp(&a.count))
+                .then_with(|| a.from.cmp(&b.from))
+        });
         rows.truncate(n);
         rows
     }
