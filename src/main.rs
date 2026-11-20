@@ -118,6 +118,24 @@ mod term {
             }
             return app.quit;
         }
+        if app.abuse_open() {
+            match code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    app.quit = true;
+                    return true;
+                }
+                KeyCode::Esc | KeyCode::Char('a') => app.close_abuse(),
+                KeyCode::Down | KeyCode::Char('j') => app.abuse_move(1),
+                KeyCode::Up | KeyCode::Char('k') => app.abuse_move(-1),
+                KeyCode::Enter => {
+                    app.open_abuse_detail();
+                }
+                KeyCode::Char('s') => app.show_settings(),
+                KeyCode::Char(' ') => app.toggle_pause(),
+                _ => {}
+            }
+            return app.quit;
+        }
         if app.detail.is_some() {
             // drill-down view: navigation-free page, Esc/Enter closes
             match code {
@@ -127,6 +145,10 @@ mod term {
                 }
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace => app.close_detail(),
                 KeyCode::Char('t') | KeyCode::Left | KeyCode::Right => app.cycle_detail_win(),
+                KeyCode::Char('a') => {
+                    app.close_detail();
+                    app.show_abuse();
+                }
                 KeyCode::Char('s') => app.show_settings(),
                 KeyCode::Char(' ') => app.toggle_pause(),
                 _ => {}
@@ -142,6 +164,7 @@ mod term {
             KeyCode::Char('c') => app.clear_stats(),
             KeyCode::Char('r') => app.poll_once("manual"),
             KeyCode::Char('s') => app.show_settings(),
+            KeyCode::Char('a') => app.show_abuse(),
             KeyCode::Char('t') => app.cycle_flow_win(),
             KeyCode::Tab => app.cycle_panel(),
             KeyCode::Char('1') => app.select_panel(0),

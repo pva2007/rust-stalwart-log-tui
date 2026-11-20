@@ -16,6 +16,10 @@ pub struct FolderWatcher {
     offsets: HashMap<PathBuf, u64>,
     /// Incomplete trailing bytes per file (last line without newline yet).
     partial: HashMap<PathBuf, String>,
+    /// Files fully consumed in one shot (compressed archives, or binary
+    /// files detected and skipped); the stored file size marks the version
+    /// that was handled.
+    done: HashMap<PathBuf, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -35,6 +39,7 @@ impl FolderWatcher {
             pattern,
             offsets: HashMap::new(),
             partial: HashMap::new(),
+            done: HashMap::new(),
         })
     }
 
@@ -67,6 +72,7 @@ impl FolderWatcher {
         // Drop tracking for files that disappeared.
         self.offsets.retain(|p, _| seen.contains(p));
         self.partial.retain(|p, _| seen.contains(p));
+        self.done.retain(|p, _| seen.contains(p));
 
         seen.sort();
         for path in seen {
@@ -83,23 +89,70 @@ impl FolderWatcher {
 
     fn read_appends(&mut self, path: &Path) -> Result<Vec<LogRecord>> {
         let mut records = Vec::new();
-
         let size = fs::metadata(path)?.len();
-        let offset = *self.offsets.get(path).unwrap_or(&0);
+        if let Some(&done_size) = self.done.get(path) {
+            if size <= done_size {
+                return Ok(Vec::new());
+            }
+            // file was replaced by a bigger one: re-read from scratch
+            self.done.remove(path);
+            self.offsets.remove(path);
+        }
 
-        // File was rotated/truncated: start from the beginning again.
-        let (mut file, offset) = if size < offset {
+        let mut file = fs::File::open(path)?;
+        // bzip2 archives cannot be consumed through byte offsets; they are
+        // one-shot rotated files, so decode them completely and, once the
+        // file does not change any more, mark it done.
+        let mut magic = [0u8; 3];
+        let compressed = file.read_exact(&mut magic).is_ok() && &magic == b"BZh";
+        drop(file);
+
+        if compressed {
+            self.done.insert(path.to_path_buf(), size);
+            // system bunzip2: no extra dependency; every macOS/Linux server
+            // and CI runner ships it
+            let out = std::process::Command::new("bunzip2")
+                .arg("-c")
+                .arg(path)
+                .output()
+                .map_err(|e| anyhow::anyhow!("bunzip2 not available: {e}"))?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "bunzip2 failed for {}: {}",
+                    path.display(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let mut records = Vec::new();
+            for line in text.lines() {
+                let line = line.trim_end_matches('\r');
+                if !line.is_empty() {
+                    records.push(crate::parser::parse_line(line));
+                }
+            }
+            return Ok(records);
+        }
+
+        let (mut file, offset) = if size < *self.offsets.get(path).unwrap_or(&0) {
             (fs::File::open(path)?, 0)
         } else {
             let mut f = fs::File::open(path)?;
-            f.seek(SeekFrom::Start(offset))?;
-            (f, offset)
+            f.seek(SeekFrom::Start(*self.offsets.get(path).unwrap_or(&0)))?;
+            (f, *self.offsets.get(path).unwrap_or(&0))
         };
 
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
         let new_offset = offset + buf.len() as u64;
         self.offsets.insert(path.to_path_buf(), new_offset);
+
+        // Binary content (tar archives, unexpected gz, editors' swap files)?
+        // Skip instead of feeding garbage to the parser.
+        if buf.contains(&0) {
+            self.done.insert(path.to_path_buf(), new_offset.max(size));
+            return Ok(Vec::new());
+        }
 
         let carry = self.partial.remove(path).unwrap_or_default();
         let mut data = carry.into_bytes();
