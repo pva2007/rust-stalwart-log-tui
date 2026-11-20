@@ -83,6 +83,10 @@ domains hosted on the server — `in` (delivery to a hosted mailbox), `out`
 (sent from a hosted domain to the outside), `local` (hosted → hosted).
 Pairs are aggregated from Queued/Delivered events.
 
+Both Top panels and the mail in/out table count **messages, not log lines**:
+one physical mail (identified by its unique `queueId`) passes through TCP →
+RCPT → queued → stored/delivered and is counted exactly once.
+
 Hosted domains are detected from the logs themselves: every message stored
 into a local mailbox (`message-ingest.*` events) contributes its recipient
 domain. Press `d` to open the hosted-domain filter — tick one or many

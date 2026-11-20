@@ -24,6 +24,8 @@ pub const MAX_REASONS_PER_IP: usize = 50;
 /// Upper bound on distinct (sender, recipient) pairs kept for the mail
 /// in/out table.
 pub const MAX_MAIL_PAIRS: usize = 20_000;
+/// Upper bound on unique message ids tracked for de-duplicated counting.
+pub const MAX_QUEUE_TRACKED: usize = 250_000;
 
 /// Per-client-IP authentication bookkeeping for the abuse view.
 #[derive(Debug, Default)]
@@ -364,6 +366,10 @@ pub struct Stats {
     /// Domains of mail stored into local mailboxes (message-ingest events):
     /// domain -> stored-message count. The "hosted" domains of this server.
     pub hosted_mailboxes: HashMap<String, u64>,
+    /// Message ids already counted in the top sender/recipient lists and
+    /// mail pairs, so one physical mail is counted once even though it
+    /// produces several log lines (queued -> stored -> delivered).
+    queue_seen: HashSet<String>,
 
     /// Per-minute in/out/err/blk flow for ALL events (key `EntityKind`-less).
     pub flow: FlowHist,
@@ -421,28 +427,52 @@ impl Stats {
         let ts = record.ts.unwrap_or(now);
         let minute = ts.timestamp() / 60;
 
+        // One physical mail produces several log lines that share its
+        // queueId (accepted -> stored -> delivered). Count senders,
+        // recipients and pairs once per message, at the first line seen.
+        let qid = record.get("queueId").map(|q| q.to_string());
+        let countable = match &qid {
+            None => matches!(record.category, Category::Queued | Category::Delivered),
+            Some(id) => {
+                if self.queue_seen.contains(id) {
+                    false
+                } else {
+                    if self.queue_seen.len() < MAX_QUEUE_TRACKED {
+                        self.queue_seen.insert(id.clone());
+                    }
+                    true
+                }
+            }
+        };
+
         let mut sender_key: Option<String> = None;
         if let Some(from) = record.get("from") {
             let emails = emails_in(from);
             let display = if emails.is_empty() { from } else { &emails[0] };
             sender_key = Some(display.to_string());
-            *self.top_senders.entry(display.to_string()).or_default() += 1;
         }
         let recipients = record
             .get("to")
             .map(emails_in)
             .unwrap_or_default();
         if !recipients.is_empty() {
-            for to in &recipients {
-                *self.top_recipients.entry(to.clone()).or_default() += 1;
+            if countable {
+                for to in &recipients {
+                    *self.top_recipients.entry(to.clone()).or_default() += 1;
+                }
             }
-        } else if matches!(record.category, Category::Delivered | Category::Failed) {
+        } else if countable && matches!(record.category, Category::Delivered | Category::Failed) {
             for email in emails_in(&record.message) {
                 *self.top_recipients.entry(email.clone()).or_default() += 1;
             }
         }
+        if countable
+            && let Some(d) = sender_key.as_deref()
+        {
+            *self.top_senders.entry(d.to_string()).or_default() += 1;
+        }
 
-        self.track_mail(record, sender_key.as_deref(), &recipients);
+        self.track_mail(record, countable, sender_key.as_deref(), &recipients);
 
         if matches!(record.category, Category::AuthFail | Category::AuthOk) {
             self.track_auth(record, &ip_keys, minute);
@@ -470,8 +500,15 @@ impl Stats {
     }
 
     /// Track sender->recipient mail flow (for the mail in/out table) and
-    /// detect the hosted domains (local mailbox ingest events).
-    fn track_mail(&mut self, record: &LogRecord, sender_key: Option<&str>, recipients: &[String]) {
+    /// detect the hosted domains (local mailbox ingest events). `fresh`
+    /// marks the first log line of a physical message.
+    fn track_mail(
+        &mut self,
+        record: &LogRecord,
+        fresh: bool,
+        sender_key: Option<&str>,
+        recipients: &[String],
+    ) {
         if recipients.is_empty() {
             return;
         }
@@ -481,6 +518,9 @@ impl Stats {
             for to in recipients {
                 *self.hosted_mailboxes.entry(domain_of(to)).or_default() += 1;
             }
+        }
+        if !fresh {
+            return;
         }
         let Some(from) = sender_key else { return };
         // Queued = acceptance of a message (in to local, out via submission),
@@ -1206,6 +1246,42 @@ mod tests {
         assert!(pairs.iter().all(|p| p.dir != MailDir::Transit));
         // hosted -> hosted queued mail is "local"
         assert_eq!(pairs.iter().find(|p| p.from == "x@cdn21.de").unwrap().dir, MailDir::Local);
+    }
+
+    #[test]
+    fn message_counted_once_per_queue_id() {
+        let mut s = Stats::new();
+        let line = |event: &str, extra: &str| {
+            parse_line(&format!(
+                "2026-11-19T10:00:00Z INFO {event} {extra}, queueId = 341344700644505600, from = \"x@spam.example\", to = [\"hotel@mager.sk\"]",
+            ))
+        };
+        // same message travelling: queued -> stored -> duplicate notice
+        s.ingest(
+            &line("Queued message for delivery (queue.message-queued)", "remoteIp = 1.2.3.4"),
+            dt(1_800_000_000),
+        );
+        s.ingest(
+            &line("Message stored (message-ingest.message-stored)", "queueName = \"local\""),
+            dt(1_800_000_000),
+        );
+        s.ingest(
+            &line("Skipping duplicate message (message-ingest.duplicate)", "queueName = \"local\""),
+            dt(1_800_000_000),
+        );
+        assert_eq!(s.top_recipients.get("hotel@mager.sk"), Some(&1));
+        assert_eq!(s.top_senders.get("x@spam.example"), Some(&1));
+        // exactly one in-pair
+        assert_eq!(s.top_mail_pairs(10, None).len(), 1);
+        assert_eq!(s.queue_seen.len(), 1);
+        // outbound: relayed delivery shares the qid -> no double count
+        s.ingest(
+            &parse_line(
+                "2026-11-19T10:01:00Z INFO Message delivered (delivery.delivered) queueId = 341344700644505600, from = \"x@spam.example\", to = [\"hotel@mager.sk\"], hostname = \"mx.remote.example\"",
+            ),
+            dt(1_800_000_000),
+        );
+        assert_eq!(s.top_recipients.get("hotel@mager.sk"), Some(&1));
     }
 
     /// Integration check against the real log files shipped in `sample/`.
