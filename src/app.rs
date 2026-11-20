@@ -19,6 +19,7 @@ pub const WIN_PRESETS: [(&str, i64); 5] =
 enum Overlay {
     None,
     Settings,
+    Abuse,
 }
 
 pub struct App {
@@ -40,6 +41,9 @@ pub struct App {
     pub settings_row: usize,
     overlay: Overlay,
     dns_requested: HashSet<IpAddr>,
+
+    /// Abuse/signals view: which suspect row is selected.
+    pub abuse_row: usize,
 
     /// Top-list selection: 0 = client IPs, 1 = senders, 2 = recipients.
     pub sel_panel: usize,
@@ -79,6 +83,7 @@ impl App {
             settings_row: 0,
             overlay: Overlay::None,
             dns_requested: HashSet::new(),
+            abuse_row: 0,
             sel_panel: 0,
             sel_row: 0,
             detail: None,
@@ -211,6 +216,50 @@ impl App {
         if let Err(e) = self.settings.save(&self.settings_path) {
             self.status = format!("settings save failed: {e}");
         }
+    }
+
+    // --- abuse / signals view ---
+
+    pub fn show_abuse(&mut self) {
+        self.overlay = Overlay::Abuse;
+        self.abuse_row = 0;
+    }
+
+    pub fn close_abuse(&mut self) {
+        self.overlay = Overlay::None;
+    }
+
+    pub fn abuse_open(&self) -> bool {
+        matches!(self.overlay, Overlay::Abuse)
+    }
+
+    pub fn abuse_move(&mut self, delta: i8) {
+        let len = self.stats.abuse_report().suspects.len();
+        if len == 0 {
+            self.abuse_row = 0;
+            return;
+        }
+        let row = self.abuse_row as i64 + delta as i64;
+        self.abuse_row = row.clamp(0, len as i64 - 1) as usize;
+    }
+
+    /// Open the drill-down for the selected suspect. Returns false when the
+    /// list is empty or the row is out of range.
+    pub fn open_abuse_detail(&mut self) -> bool {
+        let suspects = self.stats.abuse_report().suspects;
+        let Some(s) = suspects.get(self.abuse_row) else {
+            return false;
+        };
+        let name = s.name.clone();
+        if let Ok(ip) = name.parse()
+            && self.settings.show_hostnames
+            && self.dns_requested.insert(ip)
+        {
+            self.dns.ensure(ip);
+        }
+        self.detail = Some((EntityKind::Ip, name));
+        self.overlay = Overlay::None;
+        true
     }
 
     /// Poll DNS answers and refresh the cache; call once per UI tick.

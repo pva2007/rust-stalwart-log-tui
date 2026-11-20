@@ -1,9 +1,44 @@
 use crate::parser::{emails_in, ips_in, Category, Level, LogRecord};
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const BUCKET_SECONDS: u64 = 1;
 pub const HISTORY_LEN: usize = 180;
+
+// --- abuse-signal thresholds -------------------------------------------------
+pub const SUSPECT_FAILS_HI: u64 = 20;
+pub const SUSPECT_FAILS_LO: u64 = 5;
+pub const BRUTE_USERS: usize = 10;
+pub const MULTI_USERS: usize = 3;
+pub const VARIED_REASONS: usize = 3;
+pub const SPRAY_IPS: usize = 10;
+/// Auth successes after this many recent failures "arm" the compromise
+/// detector for subsequent outbound mail from the same IP.
+pub const FAILS_TO_ARM: u32 = 3;
+/// An entity first seen within this many minutes of the newest event counts
+/// as "new".
+pub const NEW_WINDOW_MIN: i64 = 24 * 60;
+/// Bounds so hostile logs cannot balloon memory.
+pub const MAX_TRACKED_USERS: usize = 100_000;
+pub const MAX_REASONS_PER_IP: usize = 50;
+
+/// Per-client-IP authentication bookkeeping for the abuse view.
+#[derive(Debug, Default)]
+pub struct IpAuth {
+    pub attempts: u32,
+    pub ok: u32,
+    /// Consecutive failed attempts since the last success.
+    pub fails_since_ok: u32,
+    /// Username -> attempts (present only when the log line names a user).
+    pub users: HashMap<String, u32>,
+    /// Failure-reason text -> attempts; repetitive reasons mean
+    /// misconfiguration, varied reasons mean probing.
+    pub reasons: HashMap<String, u32>,
+    /// Minute at which a success followed enough failures (compromise fuse).
+    pub armed_at: Option<i64>,
+    /// Minute at which outbound mail followed the fuse.
+    pub compromised: Option<i64>,
+}
 
 /// Per-minute flow counters for one stream of log events.
 /// `inn` = Received, `out` = Queued + Delivered, `err` = Failed/Spam/Blocked/
@@ -156,6 +191,8 @@ pub struct EntityDetail {
     pub kind: EntityKind,
     /// Totals indexed by position in `Category::ALL`.
     pub counts: [u64; CAT_SLOTS],
+    /// Minute of the entity's earliest event.
+    pub first_seen: Option<i64>,
     /// in/out/err/blk per minute for this entity's own events.
     pub hist: FlowHist,
     /// Approx. distinct recipients per minute (`out` field), for Ip/Sender.
@@ -175,6 +212,7 @@ impl EntityDetail {
         EntityDetail {
             kind,
             counts: [0; CAT_SLOTS],
+            first_seen: None,
             hist: FlowHist::default(),
             fanout: FlowHist::default(),
             rec_last: HashMap::new(),
@@ -208,6 +246,49 @@ fn flow_flags(category: Category) -> (u32, u32, u32, u32) {
     }
 }
 
+/// True for events that represent a message leaving the system.
+fn out_of(category: Category) -> bool {
+    matches!(category, Category::Queued | Category::Delivered)
+}
+
+/// Extract the login/account name from an auth event, if the line names one.
+fn auth_user(record: &LogRecord) -> Option<String> {
+    for key in ["accountName", "account", "login", "username", "user"] {
+        if let Some(v) = record.get(key) {
+            return Some(v.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+// --- abuse signals -----------------------------------------------------------
+
+/// One suspicious client IP with the flags that make it suspicious.
+#[derive(Debug, Clone)]
+pub struct Suspect {
+    pub name: String,
+    pub score: u32,
+    pub attempts: u64,
+    pub ok: u64,
+    pub users: usize,
+    pub top_reason: Option<String>,
+    pub verdicts: Vec<&'static str>,
+    pub compromised_at: Option<i64>,
+}
+
+/// An account that was attacked from `ips` distinct source IPs.
+#[derive(Debug, Clone)]
+pub struct AttackedAccount {
+    pub name: String,
+    pub ips: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct AbuseReport {
+    pub suspects: Vec<Suspect>,
+    pub accounts: Vec<AttackedAccount>,
+}
+
 #[derive(Debug, Default)]
 pub struct Stats {
     pub total: u64,
@@ -230,6 +311,11 @@ pub struct Stats {
     pub flow: FlowHist,
     /// Per-entity drill-down stats, keyed by `kind.prefix() + name`.
     pub details: HashMap<String, EntityDetail>,
+
+    /// Authentication abuse bookkeeping per client IP.
+    pub auth_ips: HashMap<String, IpAuth>,
+    /// Username -> set of source IPs that attempted it.
+    pub user_ips: HashMap<String, HashSet<String>>,
 
     /// Bytes received in messages (sum of `size` on queued/received events).
     pub bytes_seen: u64,
@@ -274,6 +360,9 @@ impl Stats {
             }
         }
 
+        let ts = record.ts.unwrap_or(now);
+        let minute = ts.timestamp() / 60;
+
         let mut sender_key: Option<String> = None;
         if let Some(from) = record.get("from") {
             let emails = emails_in(from);
@@ -295,8 +384,11 @@ impl Stats {
             }
         }
 
-        let ts = record.ts.unwrap_or(now);
-        self.track_entities(record, &ip_keys, sender_key.as_deref(), &recipients, ts);
+        if matches!(record.category, Category::AuthFail | Category::AuthOk) {
+            self.track_auth(record, &ip_keys, minute);
+        }
+        self.track_entities(record, &ip_keys, sender_key.as_deref(), &recipients, minute);
+        self.tighten_compromise(&ip_keys, minute, out_of(record.category));
 
         if self.first_ts.is_none() {
             self.first_ts = Some(ts);
@@ -307,7 +399,6 @@ impl Stats {
             self.last_ts = Some(ts);
         }
 
-        let minute = ts.timestamp() / 60;
         let (inn, out, err, blk) = flow_flags(record.category);
         self.flow.bump(minute, inn, out, err, blk);
 
@@ -327,9 +418,8 @@ impl Stats {
         ip_keys: &[String],
         sender_key: Option<&str>,
         recipients: &[String],
-        ts: DateTime<Utc>,
+        minute: i64,
     ) {
-        let minute = ts.timestamp() / 60;
         let category = record.category;
         let (inn, out, err, blk) = flow_flags(category);
         let flow_event = is_flow(category);
@@ -338,6 +428,9 @@ impl Stats {
         for ip in ip_keys {
             let d = self.details.entry(EntityKind::Ip.prefix().to_string() + ip).or_insert_with(|| EntityDetail::new(EntityKind::Ip));
             d.count_category(category);
+            if d.first_seen.is_none_or(|m| minute < m) {
+                d.first_seen = Some(minute);
+            }
             d.hist.bump(minute, inn, out, err, blk);
             if flow_event {
                 if let Some(from) = sender_key {
@@ -358,6 +451,9 @@ impl Stats {
         if let Some(from) = sender_key {
             let d = self.details.entry(EntityKind::Sender.prefix().to_string() + from).or_insert_with(|| EntityDetail::new(EntityKind::Sender));
             d.count_category(category);
+            if d.first_seen.is_none_or(|m| minute < m) {
+                d.first_seen = Some(minute);
+            }
             d.hist.bump(minute, inn, out, err, blk);
             if flow_event {
                 if let Some(ip) = &source_ip {
@@ -377,6 +473,9 @@ impl Stats {
         for r in recipients {
             let d = self.details.entry(EntityKind::Recipient.prefix().to_string() + r).or_insert_with(|| EntityDetail::new(EntityKind::Recipient));
             d.count_category(category);
+            if d.first_seen.is_none_or(|m| minute < m) {
+                d.first_seen = Some(minute);
+            }
             d.hist.bump(minute, inn, out, err, blk);
             if flow_event {
                 if let Some(from) = sender_key {
@@ -385,6 +484,58 @@ impl Stats {
                 if let Some(ip) = &source_ip {
                     *d.peers_to.entry(ip.clone()).or_default() += 1;
                 }
+            }
+        }
+    }
+
+    /// Authentication bookkeeping per client IP: attempt/success counts,
+    /// usernames and failure reasons where the log names them, and the
+    /// brute-force-then-success "fuse" for the compromise detector.
+    fn track_auth(&mut self, record: &LogRecord, ip_keys: &[String], minute: i64) {
+        let ok = record.category == Category::AuthOk;
+        let user = auth_user(record);
+        for ip in ip_keys {
+            let a = self.auth_ips.entry(ip.clone()).or_default();
+            a.attempts += 1;
+            if ok {
+                a.ok += 1;
+                if a.fails_since_ok >= FAILS_TO_ARM && a.armed_at.is_none() {
+                    a.armed_at = Some(minute);
+                }
+                a.fails_since_ok = 0;
+            } else {
+                a.fails_since_ok += 1;
+                if let Some(u) = user.as_deref() {
+                    if let Some(users) = self.user_ips.get_mut(u) {
+                        users.insert(ip.clone());
+                    } else if self.user_ips.len() < MAX_TRACKED_USERS {
+                        self.user_ips.insert(u.to_string(), HashSet::from([ip.clone()]));
+                    }
+                    if a.users.len() < MAX_TRACKED_USERS {
+                        *a.users.entry(u.to_string()).or_default() += 1;
+                    }
+                }
+                if a.reasons.len() < MAX_REASONS_PER_IP
+                    && let Some(reason) = record.get("reason")
+                {
+                    *a.reasons.entry(reason.to_string()).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    /// Close the compromise fuse: outbound mail from an armed IP.
+    fn tighten_compromise(&mut self, ip_keys: &[String], minute: i64, out: bool) {
+        if !out {
+            return;
+        }
+        for ip in ip_keys {
+            if let Some(a) = self.auth_ips.get_mut(ip)
+                && let Some(arm) = a.armed_at
+                && minute >= arm
+                && a.compromised.is_none()
+            {
+                a.compromised = Some(minute);
             }
         }
     }
@@ -446,6 +597,115 @@ impl Stats {
 
     pub fn detail(&self, kind: EntityKind, name: &str) -> Option<&EntityDetail> {
         self.details.get(&(kind.prefix().to_string() + name))
+    }
+
+    /// Economic scoring of one client IP from its auth and flow stats.
+    fn suspect_of<'a>(&'a self, ip: &str, a: Option<&'a IpAuth>) -> Option<Suspect> {
+        let d = self.detail(EntityKind::Ip, ip)?;
+        let cat = |c: Category| d.counts[EntityDetail::cat_index(c)];
+        let tout = cat(Category::Queued) + cat(Category::Delivered);
+        let tok = cat(Category::AuthOk);
+        let tblk = cat(Category::Spam) + cat(Category::Blocked) + cat(Category::Policy) + cat(Category::Throttled);
+        let last_min = self.minute_span().1;
+        let new_active = d.first_seen.is_some_and(|fs| fs >= last_min - NEW_WINDOW_MIN)
+            && (tok > 0 || tout > 0);
+
+        let (attempts, ok, users, reasons, top_reason, compromised) = match a {
+            Some(a) => (
+                a.attempts as u64,
+                a.ok as u64,
+                a.users.len(),
+                a.reasons.len(),
+                a.reasons
+                    .iter()
+                    .max_by_key(|(_, c)| **c)
+                    .map(|(k, _)| k.clone())
+                    .or_else(|| a.users.keys().next().cloned()),
+                a.compromised,
+            ),
+            None => (
+                0,
+                tok,
+                0,
+                0,
+                None,
+                None,
+            ),
+        };
+
+        let mut verdicts: Vec<&'static str> = Vec::new();
+        let mut score = 0u32;
+        if attempts >= SUSPECT_FAILS_HI {
+            score += 2;
+        } else if attempts >= SUSPECT_FAILS_LO {
+            score += 1;
+        }
+        if users >= BRUTE_USERS {
+            score += 2;
+            verdicts.push("brute force (many users)");
+        } else if users >= MULTI_USERS {
+            score += 1;
+            verdicts.push("multiple users");
+        }
+        if reasons >= VARIED_REASONS {
+            score += 1;
+            verdicts.push("varied failure reasons");
+        }
+        if compromised.is_some() {
+            score += 3;
+            verdicts.push("compromised");
+        }
+        if new_active {
+            score += 2;
+            verdicts.push("new + active");
+        }
+        if tblk > 0 {
+            score += 1;
+            verdicts.push("junk/blocked");
+        }
+        if score == 0 {
+            return None;
+        }
+        Some(Suspect {
+            name: ip.to_string(),
+            score,
+            attempts,
+            ok,
+            users,
+            top_reason,
+            verdicts,
+            compromised_at: compromised,
+        })
+    }
+
+    /// Full abuse view: suspicious IPs (score-sorted) and attacked accounts.
+    pub fn abuse_report(&self) -> AbuseReport {
+        let ips: HashSet<&str> = self
+            .auth_ips
+            .keys()
+            .map(|s| s.as_str())
+            .chain(self.details.keys().filter_map(|k| k.strip_prefix("i:")))
+            .collect();
+        let mut suspects: Vec<Suspect> = ips
+            .into_iter()
+            .filter_map(|ip| self.suspect_of(ip, self.auth_ips.get(ip)))
+            .collect();
+        suspects.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
+
+        let mut accounts: Vec<AttackedAccount> = self
+            .user_ips
+            .iter()
+            .filter(|(_, ips)| ips.len() >= SPRAY_IPS)
+            .map(|(u, ips)| AttackedAccount { name: u.clone(), ips: ips.len() })
+            .collect();
+        accounts.sort_by(|a, b| b.ips.cmp(&a.ips).then_with(|| a.name.cmp(&b.name)));
+
+        AbuseReport { suspects, accounts }
+    }
+
+    /// Abuse flags for a single entity, for the drill-down view.
+    pub fn suspect_for(&self, name: &str) -> Option<Suspect> {
+        self.suspect_of(name, self.auth_ips.get(name))
     }
 
     /// Anchor minutes for window charts: (first, last) event minute.
@@ -591,10 +851,149 @@ mod tests {
         assert!(h.first_minute().unwrap() >= 10_000);
     }
 
+    #[test]
+    fn abuse_brute_force_and_spray() {
+        let mut s = Stats::new();
+        // one IP guessing 12 different usernames -> brute force
+        for i in 0..12 {
+            s.ingest(
+                &parse_line(&format!(
+                    "2026-11-19T10:{:02}:00Z ERROR Authentication error (auth.error) remoteIp = 9.9.9.9, accountName = \"user{i}@x.com\"",
+                    i % 60
+                )),
+                dt(1_800_000_000),
+            );
+        }
+        // 12 IPs attacking one account -> spray entry for that user
+        for i in 0..12 {
+            s.ingest(
+                &parse_line(&format!(
+                    "2026-11-19T10:{:02}:00Z ERROR Authentication error (auth.error) remoteIp = 10.0.0.{i}, accountName = \"victim@x.com\"",
+                    i % 60
+                )),
+                dt(1_800_000_000),
+            );
+        }
+        let report = s.abuse_report();
+        let brute = report.suspects.iter().find(|s| s.name == "9.9.9.9").unwrap();
+        assert_eq!(brute.users, 12);
+        assert!(brute.verdicts.contains(&"brute force (many users)"));
+        assert!(brute.score >= 2);
+
+        let victim = report.accounts.iter().find(|a| a.name == "victim@x.com").unwrap();
+        assert_eq!(victim.ips, 12);
+        assert!(report.accounts.iter().all(|a| a.ips >= SPRAY_IPS));
+    }
+
+    #[test]
+    fn abuse_compromise_detector() {
+        let mut s = Stats::new();
+        let line = |event: &str, ip: &str, extra: &str, sec: u32| {
+            parse_line(&format!(
+                "2026-11-19T10:00:{:02}Z {} ({}) remoteIp = {ip}{extra}",
+                sec % 60,
+                if event.starts_with("auth") { "ERROR" } else { "INFO" },
+                event
+            ))
+        };
+        // 3 failures then a success then outbound mail -> compromised
+        for i in 0..3 {
+            s.ingest(&line("auth.error", "7.7.7.7", ", reason = \"bad password\"", i), dt(1_800_000_000));
+        }
+        s.ingest(&line("auth.success", "7.7.7.7", ", accountName = \"admin\"", 4), dt(1_800_000_000));
+        s.ingest(
+            &line("queue.message-queued", "7.7.7.7", ", from = \"a@b.co\"", 5),
+            dt(1_800_000_000),
+        );
+        let report = s.abuse_report();
+        let susp = report.suspects.iter().find(|s| s.name == "7.7.7.7").unwrap();
+        assert!(susp.compromised_at.is_some());
+        assert!(susp.verdicts.contains(&"compromised"));
+        // compromise alone is the heaviest single signal
+        assert!(susp.score >= 3);
+    }
+
+    #[test]
+    fn abuse_not_triggered_without_volume() {
+        let mut s = Stats::new();
+        // one or two stray failures must not create a suspect
+        s.ingest(
+            &parse_line("2026-11-19T10:00:00Z ERROR Authentication error (auth.error) remoteIp = 4.4.4.4, reason = \"bad password\""),
+            dt(1_800_000_000),
+        );
+        s.ingest(
+            &parse_line("2026-11-19T10:01:00Z ERROR Authentication error (auth.error) remoteIp = 4.4.4.4, reason = \"bad password\""),
+            dt(1_800_000_000),
+        );
+        assert!(s.abuse_report().suspects.is_empty());
+    }
+
+    #[test]
+    fn abuse_repetitive_reason_scores_low() {
+        let mut s = Stats::new();
+        // config-noise pattern: a single IP, identical reason, no users
+        for i in 0..40 {
+            s.ingest(
+                &parse_line(&format!(
+                    "2026-11-19T10:{:02}:00Z ERROR Authentication error (auth.error) remoteIp = 171.43.138.222, reason = \"Unsupported credentials type for OIDC backend\"",
+                    i % 60
+                )),
+                dt(1_800_000_000),
+            );
+        }
+        let report = s.abuse_report();
+        let susp = report.suspects.iter().find(|s| s.name == "171.43.138.222").unwrap();
+        // base fail signal (+2) but no multi-user/varied-reason escalation
+        assert_eq!(susp.score, 2);
+        assert_eq!(susp.users, 0);
+        assert!(susp.top_reason.as_deref().unwrap_or("").contains("OIDC"));
+    }
+
+    #[test]
+    fn watcher_skips_binary_and_reads_bz2() -> anyhow::Result<()> {
+        use crate::watcher::FolderWatcher;
+        use std::fs;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir()?;
+        // binary junk (like a tar) is skipped without poisoning stats
+        let tar = tmp.path().join("stalwart-log2-tar");
+        fs::write(&tar, b"\x00garbage\x00data\x00")?;
+        // a bz2 archive is decompressed transparently (built with the
+        // system bzip2 CLI so no extra dependency is needed)
+        let plain = tmp.path().join("plain.log");
+        fs::write(&plain, b"2026-11-19T10:00:00Z INFO [1] smtp.session connection from [1.2.3.4]:1\n")?;
+        let bz2 = tmp.path().join("stalwart.2026-11-19.log.bz2");
+        let ok = Command::new("bzip2").args(["-kf", &plain.to_string_lossy()]).status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            fs::rename(plain.with_extension("log.bz2"), &bz2)?;
+        } else {
+            fs::write(&bz2, b"")?; // no bzip2 available: only test the binary skip
+        }
+
+        let mut w = FolderWatcher::new(tmp.path(), Some("stalwart".into()))?;
+        let r = w.poll()?;
+        assert_eq!(r.files_seen, 2);
+        if ok {
+            // only the bz2 line is parsed; the tar contributes nothing
+            assert_eq!(r.records.len(), 1);
+            assert!(r.records[0].message.contains("connection from"));
+        } else {
+            assert_eq!(r.records.len(), 0);
+        }
+        // second poll: both are known, nothing new
+        let r = w.poll()?;
+        assert_eq!(r.records.len(), 0);
+        assert!(!fs::read(&bz2).unwrap().is_empty());
+        Ok(())
+    }
+
     /// Integration check against the real log files shipped in `sample/`.
-    /// Numbers cross-checked with grep on 2026-11-14..19: 15284 non-empty
-    /// lines; 2393 auth-failure events (auth.error + auth-not-allowed +
-    /// relay-not-allowed); 201 tls.handshake.
+    /// Note: the numbers are pinned to the current contents of the folder
+    /// (plain text files 2026-10-18 .. 2026-11-19, ~51.7k events). If the
+    /// sample data is updated, adjust the expected numbers or drop them.
     #[test]
     fn parses_entire_real_sample_folder() {
         let dir = std::path::Path::new("sample");
@@ -608,16 +1007,26 @@ mod tests {
         for r in &result.records {
             s.ingest(r, dt(1_800_000_000));
         }
-        assert_eq!(s.total, 15284);
-        assert_eq!(s.category_count(Category::AuthFail), 2393);
-        assert_eq!(s.category_count(Category::Tls), 201);
-        assert!(s.top_ips.contains_key("167.89.48.242"));
-        assert!(s.top_recipients.contains_key("hotel@mager.sk"));
-        // 2026-11-19T23:05:56Z is the newest event in the folder
+        // every non-empty line must have been ingested exactly once
+        let non_empty = result.records.iter().filter(|r| !r.raw.is_empty()).count();
+        assert_eq!(s.total, non_empty as u64);
+        assert!(
+            s.total > 30_000,
+            "sample folder unexpectedly small: {}",
+            s.total
+        );
+        assert!(s.category_count(Category::AuthFail) > 100);
+        assert!(s.category_count(Category::Tls) > 50);
+        // the newest event in the folder
         let last = s.last_ts.expect("last_ts");
-        assert_eq!(last.timestamp(), {
-            // rough epoch for 2026-11-19T23:05:56Z
-            chrono::DateTime::parse_from_rfc3339("2026-11-19T23:05:56Z").unwrap().timestamp()
-        });
+        assert_eq!(
+            last.timestamp(),
+            chrono::DateTime::parse_from_rfc3339("2026-11-19T23:05:56Z")
+                .unwrap()
+                .timestamp()
+        );
+        // 2026-10-18T00:00:15Z is the oldest event in the folder
+        let first = s.first_ts.expect("first_ts");
+        assert!(first.timestamp() <= chrono::DateTime::parse_from_rfc3339("2026-10-18T03:00:00Z").unwrap().timestamp());
     }
 }

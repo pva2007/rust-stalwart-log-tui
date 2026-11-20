@@ -64,6 +64,15 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_header(f, app, chunks[0], now);
 
+    if app.abuse_open() {
+        draw_abuse(f, app, chunks[1]);
+        draw_footer(f, app, chunks[2]);
+        if app.settings_open() {
+            draw_settings(f, app, f.area());
+        }
+        return;
+    }
+
     if app.detail.is_some() {
         draw_detail(f, app, chunks[1]);
         draw_footer(f, app, chunks[2]);
@@ -514,6 +523,23 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("  <- possible password spraying / brute force", Style::default().fg(Color::DarkGray)),
         ]));
     }
+    // abuse signals for client IPs
+    if detail.kind == EntityKind::Ip
+        && let Some(susp) = app.stats.suspect_for(key)
+    {
+        let mut spans = vec![
+            Span::raw(" signals: "),
+            Span::styled(format!("score {}", susp.score), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" ({})", susp.verdicts.join(", ")), Style::default().fg(if susp.score >= 5 { Color::Red } else { Color::Yellow })),
+        ];
+        if let Some(m) = susp.compromised_at {
+            let when = chrono::DateTime::from_timestamp(m * 60, 0)
+                .map(|t| format_time(app, t))
+                .unwrap_or_default();
+            spans.push(Span::styled(format!("  COMPROMISED: outbound mail after failed logins at {when}"), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+        }
+        lines.push(Line::from(spans));
+    }
     f.render_widget(
         Paragraph::new(ratatui::text::Text::from(lines)),
         Rect {
@@ -645,6 +671,98 @@ fn format_time(app: &App, ts: DateTime<Utc>) -> String {
     }
 }
 
+fn draw_abuse(f: &mut Frame, app: &App, area: Rect) {
+    let report = app.stats.abuse_report();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(6),    // suspects
+            Constraint::Length(9), // spray targets
+        ])
+        .split(area);
+    let inner_w = layout[0].width.saturating_sub(2) as usize;
+
+    let mut items: Vec<ListItem> = Vec::new();
+    items.push(ListItem::new(Line::from(Span::styled(
+        format!(
+            "  {:>3}  {:>4} {:>6} {:>3}  {:<26}{:<5}",
+            "sc", "fail", "ok", "usr", "signals / top failure reason", ""
+        ),
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+    ))));
+    if report.suspects.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  no suspicious activity detected",
+            Style::default().fg(Color::Green),
+        ))));
+    }
+    for (i, s) in report.suspects.iter().enumerate() {
+        let selected = i == app.abuse_row;
+        let base = if selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let score_style = if selected {
+            base
+        } else if s.score >= 5 || s.compromised_at.is_some() {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let head = format!(
+            "{} {:>3}  {:>4} {:>6} {:>3}  ",
+            if selected { ">" } else { " " },
+            s.score,
+            s.attempts,
+            s.ok,
+            s.users,
+        );
+        let mut spans = vec![
+            Span::styled(head, base),
+            Span::styled(truncate(&s.name, 24), base),
+            Span::raw("  "),
+            Span::styled(format!("{:<40}", truncate(&s.verdicts.join(", "), 40)), score_style),
+        ];
+        if let Some(r) = &s.top_reason {
+            spans.push(Span::styled(
+                format!(" {}", truncate(r, inner_w.saturating_sub(100).clamp(12, 50))),
+                base,
+            ));
+        }
+        items.push(ListItem::new(Line::from(spans)));
+    }
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Abuse & security signals (a / Esc closes, Enter = drill down) "),
+    );
+    f.render_widget(list, layout[0]);
+
+    let mut acc_items: Vec<ListItem> = Vec::new();
+    if report.accounts.is_empty() {
+        acc_items.push(ListItem::new(Line::from(Span::styled(
+            "  no account targeted from many IPs",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+    for a in &report.accounts {
+        acc_items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!(" {:<40} ", truncate(&a.name, 40)), Style::default().fg(Color::Red)),
+            Span::styled(
+                format!("attacked from {} client IPs", a.ips),
+                Style::default().fg(Color::Yellow),
+            ),
+        ])));
+    }
+    let list = List::new(acc_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Account spray (one account, many source IPs) "),
+    );
+    f.render_widget(list, layout[1]);
+}
+
 fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     let rows = [
         ("Show hostnames instead of IPs", if app.settings.show_hostnames { "on" } else { "off" }.to_string()),
@@ -702,28 +820,38 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width, height)
 }fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let line = Line::from(vec![
-        Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+    let chip = Style::default().fg(Color::Black).bg(Color::Cyan);
+    let mut spans = vec![
+        Span::styled(" q ", chip),
         Span::raw(" quit   "),
-        Span::styled(" space ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(" space ", chip),
         Span::raw(" pause   "),
-        Span::styled(" c ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(" c ", chip),
         Span::raw(" clear   "),
-        Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(" r ", chip),
         Span::raw(" repoll   "),
-        Span::styled(" s ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(" s ", chip),
         Span::raw(" settings   "),
-        Span::styled(" tab/1-3 ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw(" panel   "),
-        Span::styled(" j/k ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw(" select   "),
-        Span::styled(" enter ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw(" detail   "),
-        Span::styled(" t ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(" a ", chip),
+        Span::raw(" abuse   "),
+    ];
+    (!app.abuse_open() && app.detail.is_none())
+        .then(|| {
+            spans.extend([
+                Span::styled(" tab/1-3 ", chip),
+                Span::raw(" panel   "),
+                Span::styled(" j/k ", chip),
+                Span::raw(" select   "),
+                Span::styled(" enter ", chip),
+                Span::raw(" detail   "),
+            ]);
+        });
+    spans.extend([
+        Span::styled(" t ", chip),
         Span::raw(" window   "),
         Span::styled(format!(" {} ", app.status), Style::default().fg(Color::DarkGray)),
     ]);
-    f.render_widget(Paragraph::new(line), area);
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn truncate(s: &str, max: usize) -> String {
