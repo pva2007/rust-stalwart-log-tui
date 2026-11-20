@@ -22,5 +22,10 @@ rustc-ice-*.txt
 # runtime-generated settings
 stalwart-log.toml
 
+<<<<<<< HEAD
 # sample logs (kept local, may contain private data)
 /sample/
+=======
+# sample logs
+/sample/
+>>>>>>> ac4e290 (Ignore sample/ log folder (kept local, may contain private data))
