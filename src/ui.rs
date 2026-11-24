@@ -808,6 +808,22 @@ fn draw_abuse(f: &mut Frame, app: &App, area: Rect) {
     let inner_w = layout[0].width.saturating_sub(2) as usize;
 
     let mut items: Vec<ListItem> = Vec::new();
+    if let Some(t) = app.stats.fail_trend() {
+        let day = DateTime::from_timestamp(t.day * 86400, 0)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| t.day.to_string());
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!(
+                "  failure trend: {} auth fails on {} ({} new source IP{}), previous peak {}/day",
+                t.count,
+                day,
+                t.new_ips,
+                if t.new_ips == 1 { "" } else { "s" },
+                t.prev_max
+            ),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))));
+    }
     items.push(ListItem::new(Line::from(Span::styled(
         format!(
             "  {:>3}  {:>4} {:>6} {:>3}  {:<26}{:<5}",
@@ -860,7 +876,7 @@ fn draw_abuse(f: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Abuse & security signals (a / Esc closes, Enter = drill down) "),
+            .title(" Abuse & security signals (a/Esc closes, Enter = drill down, e = export) "),
     );
     f.render_widget(list, layout[0]);
 

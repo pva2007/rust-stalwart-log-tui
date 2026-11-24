@@ -27,6 +27,22 @@ pub const MAX_MAIL_PAIRS: usize = 20_000;
 /// Upper bound on unique message ids tracked for de-duplicated counting.
 pub const MAX_QUEUE_TRACKED: usize = 250_000;
 
+/// Auth-failures-per-day lower threshold for surfacing a trend hint.
+pub const FAIL_TREND_MIN: u64 = 10;
+
+/// Sudden auth-failure increase hint for the abuse screen.
+#[derive(Debug, Clone, Copy)]
+pub struct FailTrend {
+    /// UTC day (epoch/86400) with the failures.
+    pub day: i64,
+    /// Failures on that day.
+    pub count: u64,
+    /// IPs whose first-ever failure was on that day.
+    pub new_ips: u64,
+    /// Best day before this one, for comparison.
+    pub prev_max: u64,
+}
+
 /// Per-client-IP authentication bookkeeping for the abuse view.
 #[derive(Debug, Default)]
 pub struct IpAuth {
@@ -43,6 +59,9 @@ pub struct IpAuth {
     pub armed_at: Option<i64>,
     /// Minute at which outbound mail followed the fuse.
     pub compromised: Option<i64>,
+    /// UTC day (epoch/86400) of this IP's first failed attempt, used for
+    /// the failure-trend "new attacking IPs" hint.
+    pub first_fail_day: Option<i64>,
 }
 
 /// Per-minute flow counters for one stream of log events.
@@ -390,6 +409,8 @@ pub struct Stats {
     pub auth_ips: HashMap<String, IpAuth>,
     /// Username -> set of source IPs that attempted it.
     pub user_ips: HashMap<String, HashSet<String>>,
+    /// Auth failures per UTC day (epoch/86400), for trend hints.
+    pub auth_fail_days: HashMap<i64, u64>,
 
     /// Bytes received in messages (sum of `size` on queued/received events).
     pub bytes_seen: u64,
@@ -706,6 +727,10 @@ impl Stats {
                 a.fails_since_ok = 0;
             } else {
                 a.fails_since_ok += 1;
+                if a.first_fail_day.is_none() {
+                    a.first_fail_day = Some(minute / 1440);
+                }
+                *self.auth_fail_days.entry(minute / 1440).or_default() += 1;
                 if let Some(u) = user.as_deref() {
                     if let Some(users) = self.user_ips.get_mut(u) {
                         users.insert(ip.clone());
@@ -851,6 +876,11 @@ impl Stats {
         if reasons >= VARIED_REASONS {
             score += 1;
             verdicts.push("varied failure reasons");
+        } else if attempts >= SUSPECT_FAILS_LO && users == 0 && reasons == 1 {
+            // one IP, no usernames, always the same failure text: mechanism/
+            // protocol probing rather than credential guessing against an
+            // account. Informative only - no score escalation.
+            verdicts.push("protocol probe (single reason)");
         }
         if compromised.is_some() {
             score += 3;
@@ -892,7 +922,6 @@ impl Stats {
             .filter_map(|ip| self.suspect_of(ip, self.auth_ips.get(ip)))
             .collect();
         suspects.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
-
         let mut accounts: Vec<AttackedAccount> = self
             .user_ips
             .iter()
@@ -902,6 +931,35 @@ impl Stats {
         accounts.sort_by(|a, b| b.ips.cmp(&a.ips).then_with(|| a.name.cmp(&b.name)));
 
         AbuseReport { suspects, accounts }
+    }
+
+    /// Auth-failure trend over the most recent day with failures: a "hint
+    /// to the admin" pointing out sudden jumps (e.g. the start of a scan).
+    /// `None` when there are too few failures to be interesting.
+    pub fn fail_trend(&self) -> Option<FailTrend> {
+        let &day = self.auth_fail_days.keys().max()?;
+        let &count = self.auth_fail_days.get(&day)?;
+        if count < FAIL_TREND_MIN {
+            return None;
+        }
+        let prev_max = self
+            .auth_fail_days
+            .iter()
+            .filter(|&(d, _)| *d < day)
+            .map(|(_, &c)| c)
+            .max()
+            .unwrap_or(0);
+        let new_ips = self
+            .auth_ips
+            .values()
+            .filter(|a| a.first_fail_day == Some(day))
+            .count() as u64;
+        Some(FailTrend {
+            day,
+            count,
+            new_ips,
+            prev_max,
+        })
     }
 
     /// Abuse flags for a single entity, for the drill-down view.
@@ -1148,6 +1206,65 @@ mod tests {
         assert_eq!(susp.score, 2);
         assert_eq!(susp.users, 0);
         assert!(susp.top_reason.as_deref().unwrap_or("").contains("OIDC"));
+        // single-reason, no-user offenders are labelled as protocol probes,
+        // informatively only (score unchanged)
+        assert!(susp
+            .verdicts
+            .iter()
+            .any(|v| v.contains("protocol probe")));
+    }
+
+    #[test]
+    fn fail_trend_threshold_and_new_ips() {
+        let mut s = Stats::new();
+        // a few scattered failures: below FAIL_TREND_MIN -> no hint
+        for i in 0..3 {
+            s.ingest(
+                &parse_line(&format!(
+                    "2026-11-23T10:{:02}:00Z ERROR Authentication error (auth.error) remoteIp = 1.1.1.1, reason = \"bad password\"",
+                    i * 10
+                )),
+                dt(1_800_000_000),
+            );
+        }
+        assert!(s.fail_trend().is_none());
+        // a burst of 12 failures on a later day from 2 fresh IPs -> hint with
+        // the day's count, both IPs counted as new, previous peak 0
+        for i in 0..12 {
+            let day = 24;
+            let ip = if i % 2 == 0 { "2.2.2.2" } else { "3.3.3.3" };
+            s.ingest(
+                &parse_line(&format!(
+                    "2026-11-{day}T10:{:02}:00Z ERROR Authentication error (auth.error) remoteIp = {ip}, reason = \"Unsupported credentials type for OIDC backend\"",
+                    (i * 4) % 60
+                )),
+                dt(1_800_000_000),
+            );
+        }
+        let t = s.fail_trend().expect("trend after burst");
+        assert_eq!(t.count, 12);
+        assert_eq!(t.new_ips, 2);
+        // the 3 scattered 2026-11-23 failures are the previous peak
+        assert_eq!(t.prev_max, 3);
+        // day key is epoch/86400 of the burst day
+        assert_eq!(t.day, burst_day());
+        // an extra failure on an even older day does not change anything:
+        // prev_max takes the best previous day and the IPs stay "new" for
+        // the burst day only
+        s.ingest(
+            &parse_line("2026-11-22T10:00:00Z ERROR Authentication error (auth.error) remoteIp = 4.4.4.4, reason = \"bad password\""),
+            dt(1_800_000_000),
+        );
+        let t = s.fail_trend().unwrap();
+        assert_eq!(t.prev_max, 3);
+        assert_eq!(t.new_ips, 2);
+    }
+
+    fn burst_day() -> i64 {
+        chrono::DateTime::parse_from_rfc3339("2026-11-24T10:40:00Z")
+            .unwrap()
+            .timestamp()
+            / 86400
     }
 
     #[test]
@@ -1335,7 +1452,7 @@ mod tests {
         let last = s.last_ts.expect("last_ts");
         assert_eq!(
             last.timestamp(),
-            chrono::DateTime::parse_from_rfc3339("2026-11-19T23:05:56Z")
+            chrono::DateTime::parse_from_rfc3339("2026-11-24T10:25:42Z")
                 .unwrap()
                 .timestamp()
         );

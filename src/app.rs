@@ -311,8 +311,7 @@ impl App {
 
     /// Open the drill-down for the selected suspect. Returns false when the
     /// list is empty or the row is out of range.
-    pub fn open_abuse_detail(&mut self) -> bool {
-        let suspects = self.stats.abuse_report().suspects;
+    pub fn open_abuse_detail(&mut self) -> bool {        let suspects = self.stats.abuse_report().suspects;
         let Some(s) = suspects.get(self.abuse_row) else {
             return false;
         };
@@ -326,6 +325,41 @@ impl App {
         self.detail = Some((EntityKind::Ip, name));
         self.overlay = Overlay::None;
         true
+    }
+
+    /// Write the current suspect list (IP, score, verdicts, top reason) to
+    /// `suspects-<timestamp>.txt` in the working directory, one record per
+    /// line with comment lines starting `#`. Returns a status message.
+    pub fn export_suspects(&mut self) -> String {
+        let report = self.stats.abuse_report();
+        if report.suspects.is_empty() {
+            return "abuse export: no suspects to export".to_string();
+        }
+        let path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(format!(
+            "suspects-{}.txt",
+            Utc::now().format("%Y%m%d-%H%M%S")
+        ));
+        let mut out = format!(
+            "# stalwart-log abuse export {} (folder: {})\n# ip\tscore\tattempts\tok\tusers\tverdicts\ttop_reason\n",
+            Utc::now().to_rfc3339(),
+            self.folder.display()
+        );
+        for s in &report.suspects {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                s.name,
+                s.score,
+                s.attempts,
+                s.ok,
+                s.users,
+                s.verdicts.join(","),
+                truncate_reason(s.top_reason.as_deref().unwrap_or("-"), 80),
+            ));
+        }
+        match std::fs::write(&path, &out) {
+            Ok(_) => format!("exported {} suspect IPs to {}", report.suspects.len(), path.display()),
+            Err(e) => format!("abuse export failed: {e}"),
+        }
     }
 
     /// Poll DNS answers and refresh the cache; call once per UI tick.
@@ -442,4 +476,14 @@ impl App {
         }
         key.to_string()
     }
+}
+
+/// Shorten a reason string for export lines: hard-cut to `max` characters plus
+/// an ellipsis marker.
+fn truncate_reason(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(3)).collect();
+    format!("{cut}...")
 }

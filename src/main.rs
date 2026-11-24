@@ -146,6 +146,7 @@ mod term {
                     app.open_abuse_detail();
                 }
                 KeyCode::Char('s') => app.show_settings(),
+                KeyCode::Char('e') => app.status = app.export_suspects(),
                 KeyCode::Char(' ') => app.toggle_pause(),
                 _ => {}
             }

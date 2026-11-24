@@ -96,6 +96,27 @@ domains (or leave everything unticked for all), and the mail in/out table
 restricts itself to flows touching the selection. The filter persists in
 `stalwart-log.toml` as `domains = [...]` (empty list = all).
 
+## Abuse & security signals
+
+Press `a` to open the abuse screen. It scores client IPs from their auth
+behaviour and marks them with signals: `junk/blocked` (blocked or junk events),
+`brute force` (one IP, many usernames), `account spray` (one account attacked
+from many IPs), `compromised` (auth failures followed by a success and
+outbound mail from the same IP), `new + active` and
+`protocol probe (single reason)` (many failures, no usernames, always the
+same error — typically probing a login protocol rather than guessing
+passwords; informative only, does not raise the score).
+
+- **failure trend**: when the newest day with failures passes a threshold
+  (10+), a highlighted line shows that day's fail count, how many source IPs
+  saw their first-ever failure on it and the previous daily peak — a sudden
+  jump from a quiet baseline to many failures from fresh IPs is the fingerprint
+  of a starting distributed scan.
+- **`Enter`** drills down into a suspect (same view as a selected client IP).
+- **`e`** exports the current suspect list to `suspects-<timestamp>.txt` in
+  the working directory (tab-separated: ip, score, attempts, ok, users,
+  verdicts, top reason).
+
 ## Settings
 
 Press `s` to open the settings overlay. Navigate with `j`/`k` (or arrow keys),
