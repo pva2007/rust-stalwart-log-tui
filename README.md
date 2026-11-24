@@ -28,7 +28,11 @@ Keys: `q`/`Esc` quit, `space` pause/resume, `c` clear stats, `r` force re-poll.
 - **Levels**: ERROR / WARN / INFO / DEBUG / TRACE gauges
 - **Event categories**: sessions, auth success/failures, received, queued,
   delivered, bounces, spam, blocked/banned, throttled, policy (SPF/DKIM/DMARC),
-  TLS, maintenance noise
+  greylisted (deferred inbound attempts — mail rejected pending a sender
+  retry; a constant stream of these means mail is *not* getting in), TLS,
+  maintenance noise
+- **Mail flow header**: per-window totals `in` (received), `out`
+  (queued/delivered), `err` share and `def` (greylisted attempts)
 - **Top IPs / senders / recipients**: from structured `remoteIp`, `from`, `to` fields
 - **Recent problems**: latest WARN/ERROR raw lines
 

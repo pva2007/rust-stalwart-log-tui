@@ -66,7 +66,8 @@ pub struct IpAuth {
 
 /// Per-minute flow counters for one stream of log events.
 /// `inn` = Received, `out` = Queued + Delivered, `err` = Failed/Spam/Blocked/
-/// Throttled, `blk` = Spam/Blocked/Policy/Throttled (junk-ish outcomes).
+/// Throttled, `blk` = Spam/Blocked/Policy/Throttled (junk-ish outcomes),
+/// `def` = Greylisted (deferred inbound attempts, not yet accepted).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MinutePoint {
     pub minute: i64,
@@ -74,6 +75,7 @@ pub struct MinutePoint {
     pub out: u32,
     pub err: u32,
     pub blk: u32,
+    pub def: u32,
 }
 
 /// Compact time series: at most one `MinutePoint` per calendar minute,
@@ -84,16 +86,17 @@ pub struct FlowHist {
 }
 
 impl FlowHist {
-    fn bump(&mut self, minute: i64, inn: u32, out: u32, err: u32, blk: u32) {
+    fn bump(&mut self, minute: i64, inn: u32, out: u32, err: u32, blk: u32, def: u32) {
         match self.points.last_mut() {
             Some(p) if p.minute == minute => {
                 p.inn += inn;
                 p.out += out;
                 p.err += err;
                 p.blk += blk;
+                p.def += def;
             }
             Some(p) if p.minute > minute => {} // out-of-order older event: ignore
-            _ => self.points.push(MinutePoint { minute, inn, out, err, blk }),
+            _ => self.points.push(MinutePoint { minute, inn, out, err, blk, def }),
         }
         if self.points.len() > 50_000 {
             self.points.drain(..25_000);
@@ -104,23 +107,25 @@ impl FlowHist {
         self.points.first().map(|p| p.minute)
     }
 
-    /// Sum of every point from `from_min` onward: (inn, out, err, blk).
+    /// Sum of every point from `from_min` onward: (inn, out, err, blk, def).
     /// Only used in tests; the UI sums the aggregated bars instead.
     #[cfg(test)]
-    pub fn totals_since(&self, from_min: i64) -> (u64, u64, u64, u64) {
+    pub fn totals_since(&self, from_min: i64) -> (u64, u64, u64, u64, u64) {
         let mut inn = 0u64;
         let mut out = 0u64;
         let mut err = 0u64;
         let mut blk = 0u64;
+        let mut def = 0u64;
         for p in &self.points {
             if p.minute >= from_min {
                 inn += p.inn as u64;
                 out += p.out as u64;
                 err += p.err as u64;
                 blk += p.blk as u64;
+                def += p.def as u64;
             }
         }
-        (inn, out, err, blk)
+        (inn, out, err, blk, def)
     }
 
     /// Aggregate the stored minutes in `[from_min, to_min)` into
@@ -142,6 +147,7 @@ impl FlowHist {
             b.out += p.out;
             b.err += p.err;
             b.blk += p.blk;
+            b.def += p.def;
         }
         bars
     }
@@ -259,14 +265,15 @@ fn is_flow(category: Category) -> bool {
     matches!(category, Category::Received | Category::Queued | Category::Delivered | Category::Failed)
 }
 
-fn flow_flags(category: Category) -> (u32, u32, u32, u32) {
+fn flow_flags(category: Category) -> (u32, u32, u32, u32, u32) {
     match category {
-        Category::Received => (1, 0, 0, 0),
-        Category::Queued | Category::Delivered => (0, 1, 0, 0),
-        Category::Failed => (0, 0, 1, 0),
-        Category::Spam | Category::Blocked | Category::Throttled => (0, 0, 1, 1),
-        Category::Policy => (0, 0, 0, 1),
-        _ => (0, 0, 0, 0),
+        Category::Received => (1, 0, 0, 0, 0),
+        Category::Queued | Category::Delivered => (0, 1, 0, 0, 0),
+        Category::Failed => (0, 0, 1, 0, 0),
+        Category::Spam | Category::Blocked | Category::Throttled => (0, 0, 1, 1, 0),
+        Category::Greylisted => (0, 0, 0, 0, 1),
+        Category::Policy => (0, 0, 0, 1, 0),
+        _ => (0, 0, 0, 0, 0),
     }
 }
 
@@ -520,8 +527,8 @@ impl Stats {
             self.last_ts = Some(ts);
         }
 
-        let (inn, out, err, blk) = flow_flags(record.category);
-        self.flow.bump(minute, inn, out, err, blk);
+        let (inn, out, err, blk, def) = flow_flags(record.category);
+        self.flow.bump(minute, inn, out, err, blk, def);
 
         self.roll_history(ts);
         self.bucket_count += 1;
@@ -643,7 +650,7 @@ impl Stats {
         minute: i64,
     ) {
         let category = record.category;
-        let (inn, out, err, blk) = flow_flags(category);
+        let (inn, out, err, blk, def) = flow_flags(category);
         let flow_event = is_flow(category);
         let source_ip = ip_keys.first().map(|ip| format!("ip:{ip}"));
 
@@ -653,7 +660,7 @@ impl Stats {
             if d.first_seen.is_none_or(|m| minute < m) {
                 d.first_seen = Some(minute);
             }
-            d.hist.bump(minute, inn, out, err, blk);
+            d.hist.bump(minute, inn, out, err, blk, def);
             if flow_event {
                 if let Some(from) = sender_key {
                     *d.peers_from.entry(from.to_string()).or_default() += 1;
@@ -664,7 +671,7 @@ impl Stats {
                     let fanout_rec = d.rec_last.get(r) != Some(&minute);
                     if fanout_rec {
                         d.rec_last.insert(r.clone(), minute);
-                        d.fanout.bump(minute, 0, 1, 0, 0);
+                        d.fanout.bump(minute, 0, 1, 0, 0, 0);
                     }
                 }
             }
@@ -676,7 +683,7 @@ impl Stats {
             if d.first_seen.is_none_or(|m| minute < m) {
                 d.first_seen = Some(minute);
             }
-            d.hist.bump(minute, inn, out, err, blk);
+            d.hist.bump(minute, inn, out, err, blk, def);
             if flow_event {
                 if let Some(ip) = &source_ip {
                     *d.peers_from.entry(ip.clone()).or_default() += 1;
@@ -686,7 +693,7 @@ impl Stats {
                     let fanout_rec = d.rec_last.get(r) != Some(&minute);
                     if fanout_rec && (out > 0 || inn > 0) {
                         d.rec_last.insert(r.clone(), minute);
-                        d.fanout.bump(minute, 0, 1, 0, 0);
+                        d.fanout.bump(minute, 0, 1, 0, 0, 0);
                     }
                 }
             }
@@ -698,7 +705,7 @@ impl Stats {
             if d.first_seen.is_none_or(|m| minute < m) {
                 d.first_seen = Some(minute);
             }
-            d.hist.bump(minute, inn, out, err, blk);
+            d.hist.bump(minute, inn, out, err, blk, def);
             if flow_event {
                 if let Some(from) = sender_key {
                     *d.peers_from.entry(from.to_string()).or_default() += 1;
@@ -1056,9 +1063,9 @@ mod tests {
     #[test]
     fn flow_hist_windows_and_peaks() {
         let mut h = FlowHist::default();
-        h.bump(100, 1, 2, 0, 0);
-        h.bump(101, 0, 1, 0, 0);
-        h.bump(200, 0, 5, 0, 0);
+        h.bump(100, 1, 2, 0, 0, 0);
+        h.bump(101, 0, 1, 0, 0, 0);
+        h.bump(200, 0, 5, 0, 0, 0);
         let bars = h.window(100, 110, 2);
         assert_eq!(bars.len(), 5);
         assert_eq!(bars[0].minute, 100);
@@ -1069,7 +1076,7 @@ mod tests {
         assert_eq!(bars[4].out, 0);
         // any 60-minute window around minute 200 sees the 5 out events
         assert_eq!(h.peak_per_unit(0, 1000, 60), Some((200, 5)));
-        assert_eq!(h.totals_since(150), (0, 5, 0, 0));
+        assert_eq!(h.totals_since(150), (0, 5, 0, 0, 0));
     }
 
     #[test]
@@ -1089,7 +1096,7 @@ mod tests {
         assert_eq!(ip.peers_from.get("a@x.com"), Some(&2));
         assert_eq!(ip.peers_to.get("r1@y.com"), Some(&1));
         // two distinct recipients in one minute -> fan-out 2
-        assert_eq!(ip.fanout.totals_since(0), (0, 2, 0, 0));
+        assert_eq!(ip.fanout.totals_since(0), (0, 2, 0, 0, 0));
 
         let sender = s.detail(EntityKind::Sender, "a@x.com").unwrap();
         assert_eq!(sender.peers_to.get("r2@y.com"), Some(&1));
@@ -1098,14 +1105,14 @@ mod tests {
         let recip = s.detail(EntityKind::Recipient, "r1@y.com").unwrap();
         assert_eq!(recip.peers_from.get("a@x.com"), Some(&1));
         assert!(recip.peers_to.contains_key("ip:1.2.3.4"));
-        assert_eq!(s.flow.totals_since(0), (0, 2, 0, 0));
+        assert_eq!(s.flow.totals_since(0), (0, 2, 0, 0, 0));
     }
 
     #[test]
     fn flow_hist_caps_memory() {
         let mut h = FlowHist::default();
         for m in 0..60_000i64 {
-            h.bump(m, 1, 0, 0, 0);
+            h.bump(m, 1, 0, 0, 0, 0);
         }
         assert!(h.first_minute().unwrap() >= 10_000);
     }
@@ -1265,6 +1272,30 @@ mod tests {
             .unwrap()
             .timestamp()
             / 86400
+    }
+
+    #[test]
+    fn greylisted_is_its_own_category_and_def_counter() {
+        use crate::parser::Category;
+        let mut s = Stats::new();
+        // greylist deferrals are neither spam nor received mail: they are
+        // deferred inbound attempts counted in the `def` flow bucket
+        for i in 0..3 {
+            s.ingest(
+                &parse_line(&format!(
+                    "2026-11-24T10:{:02}:00Z INFO RCPT TO greylisted (smtp.rcpt-to-greylisted) listenerId = \"smtp\", remoteIp = 212.5.214.212, to = \"info@mager.sk\"",
+                    i
+                )),
+                dt(1_800_000_000),
+            );
+        }
+        assert_eq!(s.category_count(Category::Greylisted), 3);
+        assert_eq!(s.category_count(Category::Spam), 0);
+        assert_eq!(s.category_count(Category::Received), 0);
+        assert_eq!(s.flow.totals_since(0), (0, 0, 0, 0, 3));
+        // the old text-fallback also routes greylisted wording correctly
+        s.ingest(&parse_line("2026-11-24T01:00:00Z INFO RCPT TO greylisted"), dt(1_800_000_000));
+        assert_eq!(s.category_count(Category::Greylisted), 4);
     }
 
     #[test]

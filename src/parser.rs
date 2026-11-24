@@ -55,6 +55,7 @@ pub enum Category {
     Blocked,
     Throttled,
     Policy,
+    Greylisted,
     Tls,
     Disconnect,
     Noise,
@@ -62,7 +63,7 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 15] = [
+    pub const ALL: [Category; 16] = [
         Category::Connect,
         Category::AuthOk,
         Category::AuthFail,
@@ -74,6 +75,7 @@ impl Category {
         Category::Blocked,
         Category::Throttled,
         Category::Policy,
+        Category::Greylisted,
         Category::Tls,
         Category::Disconnect,
         Category::Noise,
@@ -93,6 +95,7 @@ impl Category {
             Category::Blocked => "Blocked/Banned",
             Category::Throttled => "Throttled",
             Category::Policy => "Policy (SPF/DKIM/DMARC)",
+            Category::Greylisted => "Greylisted (def.)",
             Category::Tls => "TLS handshakes",
             Category::Disconnect => "Disconnects",
             Category::Noise => "Maintenance noise",
@@ -105,7 +108,7 @@ impl Category {
         match self {
             Category::AuthOk | Category::Delivered => Color::Green,
             Category::AuthFail | Category::Failed | Category::Blocked | Category::Spam => Color::Red,
-            Category::Throttled | Category::Policy => Color::Yellow,
+            Category::Throttled | Category::Policy | Category::Greylisted => Color::Yellow,
             Category::Noise => Color::DarkGray,
             Category::Connect | Category::Tls => Color::Cyan,
             _ => Color::Gray,
@@ -211,6 +214,7 @@ pub fn category_from_event(event: &str) -> Option<Category> {
             "security.ip-blocked" | "security.scan-ban" | "smtp.invalid-ehlo"
             | "smtp.vrfy-disabled" | "smtp.expn-disabled" => Category::Blocked,
             "smtp.rate-limit-exceeded" | "throttle.rate-limit-exceeded" => Category::Throttled,
+            "smtp.rcpt-to-greylisted" => Category::Greylisted,
             "tls.handshake" => Category::Tls,
             "queue.message-delivered" | "queue.message-relayed" => Category::Delivered,
             "queue.message-failed" | "message-ingest.error" | "store.s3-error" => Category::Failed,
@@ -286,7 +290,10 @@ pub fn classify(event: Option<&str>, message: &str) -> Category {
     if hay.contains("throttl") || hay.contains("rate limit") || hay.contains("too many") {
         return Category::Throttled;
     }
-    if hay.contains("spam") || hay.contains("virus") || hay.contains("greylist") {
+    if hay.contains("greylist") {
+        return Category::Greylisted;
+    }
+    if hay.contains("spam") || hay.contains("virus") {
         return Category::Spam;
     }
     if hay.contains("dkim") || hay.contains("spf") || hay.contains("dmarc") {

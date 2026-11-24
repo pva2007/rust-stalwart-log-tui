@@ -96,7 +96,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Constraint::Length(6), // throughput sparkline
             Constraint::Length(8), // mail flow (in/out/err)
             Constraint::Length(6), // level gauges
-            Constraint::Length(7), // event categories (3 columns, 5 rows)
+            Constraint::Length(8), // event categories (3 columns, 6 rows)
             Constraint::Min(0),    // mail in/out (sender -> recipient)
         ])
         .split(body[0]);
@@ -262,13 +262,15 @@ fn draw_mail_flow(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
+    let tdef = sum(&bars, |b| b.def);
     let title = format!(
-        " Mail flow last {} │ in {} out {} err {} ({:.1}%) │ t change ",
+        " Mail flow last {} │ in {} out {} err {} ({:.1}%) def {} │ t change ",
         label,
         human_count(tin),
         human_count(tout),
         human_count(terr),
-        err_pct
+        err_pct,
+        human_count(tdef)
     );
     f.render_widget(
         Block::default().borders(Borders::ALL).title(title),
